@@ -14,7 +14,7 @@ if(!(exists("skip_config_popup") && skip_config_popup)){
 label_problemen <- NULL
 # benodigde packages installeren als deze afwezig zijn
 pkg_nodig = c("tidyverse", "survey", "haven", "this.path", "textutils",
-              "labelled", "openxlsx", "knitr")
+              "labelled", "openxlsx", "knitr", "glue") # Glue toegevoegd voor kubusdata
 
 for (pkg in pkg_nodig) {
   if (system.file(package = pkg) == "") {
@@ -30,10 +30,12 @@ library(textutils)
 library(labelled)
 library(openxlsx)
 library(knitr)
+library(glue)
 
 # instellen werkmap voor het laden van de andere bestanden
 setwd(dirname(this.path()))
 source("tbl_helpers.R")
+source("tbl_MakeKubus.R") # Nieuw script sourcen
 
 # niveau van weergave van meldingen
 # mogelijke waarden: ERR / WARN / MSG / DEBUG, waarbij een hoger niveau melding altijd weergegeven wordt
@@ -83,7 +85,7 @@ log.save = T
   # daadwerkelijk inlezen configuratie
   # TODO: onmogelijke waardes checken
   sheets = c("algemeen", "crossings", "datasets", "indeling_rijen", "onderdelen", "opmaak", "labelcorrectie", "logos", "intro_tekst", "headers_afkortingen",
-             "dichotoom", "niet_dichotoom", "forceer_datatypen", "swing_algemeen", "swing_configuraties")
+             "dichotoom", "niet_dichotoom", "forceer_datatypen", "swing_configuraties", "swing_variabelen")
   for (sheet in sheets) {
     tmp = read.xlsx(config.file, sheet=sheet)
     
@@ -194,12 +196,42 @@ log.save = T
   
   # swing verwerking is later toegevoegd, dus uit gaan van niet bij geen waarde
   if (!"swing_output" %in% colnames(algemeen)) {
-    algemeen$swing_output = FALSE
+    algemeen$swing_output <- FALSE
     msg("Er is geen kolom met de naam 'swing_output' aanwezig in algemeen. Standaardinstelling (ONWAAR) wordt aangenomen.", level=WARN)
   } else {
-    algemeen$swing_output[is.na(algemeen$swing_output)] = F
+    algemeen$swing_output[is.na(algemeen$swing_output)] = FALSE
+  }
+  if (algemeen$swing_output && (!"swing_output_bestandsnaam" %in% colnames(algemeen) || is.na(algemeen$swing_output_bestandsnaam))) {
+    algemeen$swing_output_bestandsnaam <- "kubusdata"
+    msg("Er is geen naam voor het swing/platte_kubus output bestand gegeven. Standaardnaam ('kubusdata') wordt aangenomen.", level=WARN)
+  }
+
+  
+  
+  
+  # Swing_configuraties aanvullen met de nodige informatie uit datasets
+  
+  # Swing_configuraties$gebiedsniveau mag niet leeg zijn
+  if (any(is.na(swing_configuraties$gebiedsniveau))) {
+    msg("In tabblad swing_configuraties is het gebiedsniveau niet ingevuld op rij(s) %s. Vul dit in, dit is verplicht voor swing analyses.",
+        str_c(which(is.na(swing_configuraties$gebiedsniveau)), collapse=", "), level=ERR)
   }
   
+  
+  # Swing_configuratie tbl_dataset toevoegen als rijnummer van datasets,
+  # om dit later te kunnen gebruiken bij het bouwen van de swing data als filter
+  # (Alternatief zou zijn de dataset_naam aan data toe tevoegen)
+  replace_empty_with_na <- function(x) {if (length(x) == 0) return(NA_integer_) else return(x)}
+   swing_configuraties <- swing_configuraties |> 
+    rowwise() |> 
+    mutate(
+      tbl_dataset = replace_empty_with_na(which(datasets$naam_dataset == naam_dataset))
+      ) |> 
+    ungroup()
+  
+  swing_configuraties <- left_join(swing_configuraties, datasets, by = "naam_dataset")
+   
+   
   # variabelelijst afleiden uit de indeling van het tabellenboek;
   # iedere regel met (n)var is een variabele die we nodig hebben
   varlist = indeling_rijen[indeling_rijen$type %in% c("var", "nvar"),]
@@ -232,7 +264,7 @@ log.save = T
   } else{
     msg("Geen kloppend tabblad crossings. Deze moet bestaan uit één of twee kolommen; crossings en (optioneel) toetsen. Standaard is 'crossings' in cel A1 en verder een lege sheet. Voor meer informatie zie documentatie.", level=ERR)
   }
-
+  
   if (any(crossings %in% onderdelen$subset)) {
     msg("De variabele(n) %s is/zijn ingevuld als crossing en subset. Een subset kan niet met zichzelf gekruist worden.",
         str_c(crossings[crossings %in% onderdelen$subset], ", "), level=WARN)
@@ -555,11 +587,11 @@ log.save = T
         rename(stratum = strata)
       if(file.exists(datasets$fpc[d])){
         # als het een pad is: zoek de fpc data op en berekenen sampling prob per stratum
-          fpc_data <- fpc_data %>% left_join(
-            read.xlsx(datasets$fpc[d]) %>% 
-              mutate(stratum = as.factor(stratum)),
-            join_by(stratum == stratum)
-          ) %>% 
+        fpc_data <- fpc_data %>% left_join(
+          read.xlsx(datasets$fpc[d]) %>% 
+            mutate(stratum = as.factor(stratum)),
+          join_by(stratum == stratum)
+        ) %>% 
           mutate(fpc = populatiegrootte)
       } else if(grepl("GROOTGEWICHT_", datasets$fpc[d])){
         if(is.na(datasets$stratum[d])){stop("Bij FPC is het verplicht een stratum op te geven.")}
@@ -596,11 +628,11 @@ log.save = T
         msg("Er bevinden zich kleine strata in de data waarvoor de geschatte populatiegrootte kleiner is dan aantal respondenten. Er wordt nu aangenomen dat de populatiegrootte gelijk is aan aantal respondenten. Het gaat om:", level=MSG)
         fpc_per_respondent <- fpc_per_respondent %>% 
           mutate(
-          fpc = case_when(
-            fpc < Freq ~ Freq,
-            T ~ fpc
+            fpc = case_when(
+              fpc < Freq ~ Freq,
+              T ~ fpc
+            )
           )
-        )
         print(fpc_per_respondent[is_small_strata,])
       }
       
@@ -752,7 +784,7 @@ log.save = T
     if (!is.na(kolom_opbouw$subset[i])) {
       subsetvals = val_labels(data[[kolom_opbouw$subset[i]]])
       if (is.null(subsetvals))
-        msg("In kolom %d wordt gesplitst op subset %s, maar deze variabele heeft geen labels in de dataset. Hierdoor kunnen de resultaten niet worden berekend. Voeg labels toe aan de dataset, of pas de kolomindeling aan op het tabblad onderdelen.",
+        msg("In kolom %d wordt gesplitst op subset %s, maar deze variabele heeft geen labels in de dataset. Hierdoor kunnen de resultaten niet worden berekend. Voeg labels toe aan de dataset, of verwijder de subset.",
             i, kolom_opbouw$subset[i], level=ERR)
       
       for (val in subsetvals) {
@@ -780,6 +812,7 @@ log.save = T
   }
   
   ##### begin berekeningen
+  
   # mochten er subsets zijn, dan is het efficiënter om 1x te berekenen welke matches hierin bestaan
   # een tabellenboek wordt meestal gemaakt voor een geografische eenheid (gemeente/regio/GGD-gebied)
   # daarbij kan het zijn dat een vergelijkingskolom wordt toegevoegd van een groter gebied (bijv. gemeente Apeldoorn vs. subregio Midden-IJssel)
@@ -922,7 +955,7 @@ log.save = T
           }
         }
       }
-
+      
       # aanmaken van design, afhankelijk van of er fpc is.
       if("fpc" %in% colnames(datasets)){
         design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, fpc=~fpc, data=data.tmp)  
@@ -937,6 +970,7 @@ log.save = T
       t.vars = c(t.vars, t.after-t.before)
       
       msg("Variabele %d/%d berekend; rekentijd %0.1f sec.", i, nrow(varlist), t.after-t.before, level=MSG)
+      
     }
     t.end = proc.time()["elapsed"]
     msg("Totale rekentijd %0.2f min voor %d variabelen. Gemiddelde tijd per variabele was %0.1f sec (range %0.1f - %0.1f).",
@@ -953,6 +987,16 @@ log.save = T
     write.csv(results, sprintf("resultaten_csv/results_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(fpc_data, sprintf("resultaten_csv/fpc_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
   }
+  
+  
+  source(paste0(dirname(this.path()), "/tbl_MakeKubus.R"))
+  if (algemeen$swing_output) {
+    MaakKubusData(data = data,
+                  configuraties = swing_configuraties,
+                  variabelen = swing_variabelen)
+  }
+  
+  
   
   ##### begin wegschrijven tabellenboeken
   basefilename = coalesce(opmaak$waarde[opmaak$type == "naam_tabellenboek"], "Overzicht")
@@ -1007,7 +1051,7 @@ log.save = T
       } else {
         algemeen$confidence_level = max(bh.table[bh.table[,1] < bh.table[,3],1])
         msg("De gewenste afkapwaarde voor significantie is met Benjamini-Hochberg-correctie op basis van %d toetsen aangepast van %e naar %e.",
-           n_sign_tests, algemeen$confidence_level_orig, algemeen$confidence_level, level=MSG)
+            n_sign_tests, algemeen$confidence_level_orig, algemeen$confidence_level, level=MSG)
       }
     } else if (algemeen$multiple_testing_correction == "bonferroni") {
       algemeen$confidence_level = algemeen$confidence_level / n_sign_tests
@@ -1026,6 +1070,7 @@ log.save = T
       }
     }
   }
+  
   if (!is.na(algemeen$template_html)) {
     # uitdraaien tabellenboeken in HTML-vorm voor digitoegankelijkheid
     source(paste0(dirname(this.path()), "/tbl_MakeHtml.R"))
@@ -1070,18 +1115,5 @@ log.save = T
       MakeExcel(results, var_labels, kolom_opbouw, colnames(subsetmatches)[1], subsetvals[s], subsetmatches, n_resp, filename=paste0(basefilename, " ", names(subsetvals[s])))
     }
   }
-  
-  if ("swing_output" %in% colnames(algemeen) && isTRUE(algemeen$swing_output)) {
-    browser()
-    # uitdraaien Swing output bestanden in Excel
-    source(paste0(dirname(this.path()), "/tbl_MakeSwing.R"))
-    
-    if (!dir.exists("output_swing")) dir.create("output_swing")
-    
-    msg("Swing export bestanden worden gemaakt.", level=MSG)
-    MakeSwing(results, var_labels, kolom_opbouw, subset, subsetmatches, n_resp, filename=paste0(basefilename, " Swing"))
-    
-  }
-
 }
 
