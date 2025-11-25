@@ -83,7 +83,7 @@ log.save = T
   # daadwerkelijk inlezen configuratie
   # TODO: onmogelijke waardes checken
   sheets = c("algemeen", "crossings", "datasets", "indeling_rijen", "onderdelen", "opmaak", "labelcorrectie", "logos", "intro_tekst", "headers_afkortingen",
-             "dichotoom", "niet_dichotoom", "forceer_datatypen")
+             "dichotoom", "niet_dichotoom", "forceer_datatypen", "swing_algemeen", "swing_configuraties")
   for (sheet in sheets) {
     tmp = read.xlsx(config.file, sheet=sheet)
     
@@ -190,6 +190,14 @@ log.save = T
   # naam_tabellenboek is later toegevoegd bij opmaak, en kan als enige voor problemen zorgen, dus...
   if (sum(opmaak$type == "naam_tabellenboek") == 0) {
     opmaak = rbind(opmaak, data.frame(type="naam_tabellenboek", waarde="Overzicht"))
+  }
+  
+  # swing verwerking is later toegevoegd, dus uit gaan van niet bij geen waarde
+  if (!"swing_output" %in% colnames(algemeen)) {
+    algemeen$swing_output = FALSE
+    msg("Er is geen kolom met de naam 'swing_output' aanwezig in algemeen. Standaardinstelling (ONWAAR) wordt aangenomen.", level=WARN)
+  } else {
+    algemeen$swing_output[is.na(algemeen$swing_output)] = F
   }
   
   # variabelelijst afleiden uit de indeling van het tabellenboek;
@@ -772,7 +780,6 @@ log.save = T
   }
   
   ##### begin berekeningen
-  
   # mochten er subsets zijn, dan is het efficiënter om 1x te berekenen welke matches hierin bestaan
   # een tabellenboek wordt meestal gemaakt voor een geografische eenheid (gemeente/regio/GGD-gebied)
   # daarbij kan het zijn dat een vergelijkingskolom wordt toegevoegd van een groter gebied (bijv. gemeente Apeldoorn vs. subregio Midden-IJssel)
@@ -1019,7 +1026,6 @@ log.save = T
       }
     }
   }
-  
   if (!is.na(algemeen$template_html)) {
     # uitdraaien tabellenboeken in HTML-vorm voor digitoegankelijkheid
     source(paste0(dirname(this.path()), "/tbl_MakeHtml.R"))
@@ -1064,4 +1070,18 @@ log.save = T
       MakeExcel(results, var_labels, kolom_opbouw, colnames(subsetmatches)[1], subsetvals[s], subsetmatches, n_resp, filename=paste0(basefilename, " ", names(subsetvals[s])))
     }
   }
+  
+  if ("swing_output" %in% colnames(algemeen) && isTRUE(algemeen$swing_output)) {
+    browser()
+    # uitdraaien Swing output bestanden in Excel
+    source(paste0(dirname(this.path()), "/tbl_MakeSwing.R"))
+    
+    if (!dir.exists("output_swing")) dir.create("output_swing")
+    
+    msg("Swing export bestanden worden gemaakt.", level=MSG)
+    MakeSwing(results, var_labels, kolom_opbouw, subset, subsetmatches, n_resp, filename=paste0(basefilename, " Swing"))
+    
+  }
+
 }
+
