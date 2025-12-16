@@ -6,17 +6,11 @@ MaakKubusData <- function(
     configuraties,
     variabelen,
     output_bestandsnaam_prefix = "kubusdata",
-    output_folder = "swing_output"
+    output_folder = "output_swing",
+    missing_voor_privacy = -99996,
+    max_char_labels = 100,
+    dummy_crossing_var = "dummy_crossing"
 ) {
-  
-  # # Instellingen (overgenomen uit global.R of default voor platte data)
-  # min_observaties <- 0
-  # min_observaties_per_cel <- 0
-  # missing_voor_privacy <- -99996
-  # max_char_labels <- 100
-  # bron <- "GGD" # Default bronvermelding
-  # is_kubus <- 0 # 0 want platte data (geen crossings)
-  dummy_crossing_var <- "dummy_crossing"
   
   # Check of output map bestaat
   if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
@@ -44,7 +38,7 @@ MaakKubusData <- function(
   }
   
   # Check of crossing bestaan
-  crossings_niet_in_data <- vars[!vars %in% names(data)]
+  crossings_niet_in_data <- crossings_niet_in_data <- crossings[!crossings %in% names(data)]
   if (length(crossings_niet_in_data) > 0 |
       (length(crossings_niet_in_data) == 1 && crossings_niet_in_data == dummy_crossing_var)) {
     msg("Crossings %s niet gevonden in data voor kubus export.\r\n", paste(crossings_niet_in_data, collapse = ", "), level = WARN)
@@ -90,6 +84,10 @@ MaakKubusData <- function(
     crossings
   )
   
+  # Verwijder alle rows waar geen_crossing maar toch wel crossing
+  configs <- configs |> 
+    filter(!(geen_crossings & crossings != dummy_crossing_var))
+  
   # Bij geen_crossings alles behalve dummy var weghalen
   configs <- configs |> 
     filter(!(isTRUE(geen_crossings) & crossings != dummy_crossing_var))
@@ -100,10 +98,19 @@ MaakKubusData <- function(
     pwalk(function(...){
       args <- list(...)
       
+      min_observaties <- algemeen$min_observaties_per_vraag
+      min_observaties_per_cel <- algemeen$min_observaties_per_cel
+      bron <- args$bron
+      is_kubus <- if (isTRUE(args$geen_crossings)) 0 else 1
+      
+      
+      
+      
       # Kopie maken om orginele data niet aan te tasten
       kubusdata <- data |> 
         filter(tbl_dataset == args$tbl_dataset) |> 
         mutate(geolevel = args$gebiedsniveau)
+      
       
       
       if (is.na(args$jaarvariabele)) {
@@ -136,23 +143,26 @@ MaakKubusData <- function(
       #   select(all_of(necessary_cols))
       
       
+      # Crossing opnemen als geen_crossings == FALSE en deze bestaat (anders niet groeperen op crossing)
+      use_crossing <- !isTRUE(args$geen_crossings) &&
+        args$crossings != dummy_crossing_var &&
+        (args$crossings %in% names(kubusdata))
+      
       grouping_cols <- c("Jaar", "geolevel", "geoitem")
-      if (!args$geen_crossings) {
+      if (use_crossing) {
         grouping_cols <- c(grouping_cols, args$crossings)
       }
       
-      # if (!is.na(args$gebiedsindeling_kolom)) {
-      #   kubusdata <- kubusdata |> 
-      #     filter(!is.na(.data[[args$gebiedsindeling]]))
-      # }
-      
       kubusdata <- kubusdata |>
-        filter(!is.na(geoitem),
-               !is.na(.data[[args$vars]]),
-               !is.na(.data[[args$crossings]]),
-               !is.na(.data[[args$weegfactor]]))
+        dplyr::filter(!is.na(.data$geoitem),
+                      !is.na(.data[[args$vars]]),
+                      !is.na(.data[[args$weegfactor]]))
       
-      browser()
+      # Alleen crossing filteren wanneer use_crossing == TRUE
+      if (use_crossing) {
+        kubusdata <- kubusdata |>
+          dplyr::filter(!is.na(.data[[args$crossings]]))
+      }
       
       kubusdata <- kubusdata |> 
         group_by(across(all_of(c(grouping_cols, args$vars)))) |> 
@@ -163,194 +173,238 @@ MaakKubusData <- function(
         )
       
       if (nrow(kubusdata) == 0) {
-        msg("Geen data over voor kubus export van variabele %s (mogelijk alles missing).", variabele, level = WARN)
+        if (is_kubus) {
+          out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), as.character(args$gebiedsniveau))
+          bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, "_", args$crossing, ".xlsx"))
+        } else {
+          out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), paste0(as.character(args$gebiedsniveau), "_totaal"))
+          bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, ".xlsx"))
+        }
+        msg("Geen data over voor kubus export voor variabele %s: %s (mogelijk alles missing).",args$vars, bestandsnaam, level = WARN)
         return()
       }
       
-      # Pivot naar breed formaat (platte structuur: 1 rij per gebied/jaar, kolommen per antwoord)
+      # Pivot naar breed: zowel gewogen als ongewogen meenemen (voor celmaskering)
       kubusdata <- kubusdata |>
-        group_by(across(all_of(grouping_cols))) |> 
-        mutate(!!paste0(args$vars, "_ONG") := sum(n_ongewogen, na.rm = TRUE)) |> 
-        ungroup() |> 
-        pivot_wider(
-          # Keep Year, Group, and the new ONG column fixed
-          id_cols = c(grouping_cols, ends_with("_ONG")), 
-          names_from = all_of(args$vars),
-          values_from = n_gewogen,
-          # Add the variable name as a prefix (AGETS411_0, AGETS411_1)
-          names_prefix = paste0(args$vars, "_"), 
-          values_fill = 0
+        tidyr::pivot_wider(
+          id_cols = dplyr::all_of(grouping_cols),
+          names_from = dplyr::all_of(args$vars),
+          values_from = c(n_gewogen, n_ongewogen),
+          values_fill = 0,
+          names_sep = "_"
         )
       
+      # Herbereken totaal ongewogen ONG als som van n_ongewogen_* kolommen
+      ongewogen_cols <- grep("^n_ongewogen_", names(kubusdata), value = TRUE)
+      if (length(ongewogen_cols) > 0) {
+        kubusdata <- kubusdata |>
+          dplyr::rowwise() |>
+          dplyr::mutate(!!paste0(args$vars, "_ONG") := sum(dplyr::c_across(dplyr::all_of(ongewogen_cols)), na.rm = TRUE)) |>
+          dplyr::ungroup()
+      } else {
+        # als er om wat voor reden dan ook geen ongewogen kolommen zijn, fallback op 0
+        kubusdata[[paste0(args$vars, "_ONG")]] <- 0
+      }
       
+      # Gewogen kolommen hernoemen naar {variabele}_{waarde} (n_gewogen_0 -> VAR_0)
+      gewogen_cols <- grep("^n_gewogen_", names(kubusdata), value = TRUE)
+      if (length(gewogen_cols) > 0) {
+        nieuwe_namen <- sub("^n_gewogen_", paste0(args$vars, "_"), gewogen_cols)
+        names(kubusdata)[match(gewogen_cols, names(kubusdata))] <- nieuwe_namen
+      }
       
+      # Labels van de inhoudelijke variabele
+      vl <- labelled::val_labels(data[[args$vars]])
+      if (is.null(vl) || length(vl) == 0) {
+        unieke_vals <- sort(unique(data[[args$vars]]))
+        vl <- stats::setNames(as.numeric(unieke_vals), as.character(unieke_vals))
+      }
+      ans_values <- as.character(unname(vl))   # codes zoals "0","1","2"
+      ans_labels <- names(vl)                  # labels zoals "Ja","Nee",...
+      
+      # Lijsten met kolommen
+      antwoordkolommen <- paste0(args$vars, "_", ans_values)     # gewogen data-kolommen
+      ongewogen_celkolommen <- paste0("n_ongewogen_", ans_values) # per-antwoord ongewogen aantallen (alleen voor maskering)
+      ong_col <- paste0(args$vars, "_ONG")
+      
+      # Zorg dat alle kolommen aanwezig zijn (ontbrekende aanmaken)
+      ontbrekend_w <- setdiff(antwoordkolommen, names(kubusdata))
+      if (length(ontbrekend_w) > 0) for (mc in ontbrekend_w) kubusdata[[mc]] <- 0
+      ontbrekend_u <- setdiff(ongewogen_celkolommen, names(kubusdata))
+      if (length(ontbrekend_u) > 0) for (mc in ontbrekend_u) kubusdata[[mc]] <- 0
+      if (!ong_col %in% names(kubusdata)) kubusdata[[ong_col]] <- 0
+      
+      # Basis-kolommen voor Data
+      base_cols <- c("Jaar", "geolevel", "geoitem")
+      if (!isTRUE(args$geen_crossings) && args$crossings %in% names(kubusdata)) {
+        base_cols <- c(base_cols, args$crossings)
+      }
+      
+      # Filter op volgorde en houd alleen Swing-kolommen in Data (ongewogen celniveau kolommen blijven alleen voor maskering)
+      data_cols <- c(base_cols, antwoordkolommen, ong_col)
+      data_cols <- data_cols[data_cols %in% names(kubusdata)]
+      
+      # Privacy: rijniveau (ONG < min_observaties) -> alle waarden missing
+      rij_te_weinig <- kubusdata[[ong_col]] < min_observaties & kubusdata[[ong_col]] != missing_voor_privacy
+      if (any(rij_te_weinig, na.rm = TRUE)) {
+        kubusdata[rij_te_weinig, antwoordkolommen] <- missing_voor_privacy
+        kubusdata[rij_te_weinig, ong_col] <- missing_voor_privacy
+      }
+      
+      # Privacy: celniveau (n_ongewogen_<code> < min_observaties_per_cel) -> alleen die cel missing
+      if (min_observaties_per_cel > 0) {
+        for (i in seq_along(ans_values)) {
+          cel_u_col <- ongewogen_celkolommen[i]
+          cel_w_col <- antwoordkolommen[i]
+          if (cel_u_col %in% names(kubusdata) && cel_w_col %in% names(kubusdata)) {
+            mask <- kubusdata[[cel_u_col]] < min_observaties_per_cel & kubusdata[[cel_u_col]] != missing_voor_privacy
+            if (any(mask, na.rm = TRUE)) {
+              kubusdata[mask, cel_w_col] <- missing_voor_privacy
+            }
+          }
+        }
+      }
+      
+      # Data klaarzetten (zonder de n_ongewogen_* hulpkolommen)
+      kubus_df <- kubusdata |>
+        dplyr::select(dplyr::all_of(data_cols))
+      
+      # Excel workbook opbouwen
+      wb <- openxlsx::createWorkbook()
+      
+      # 1) Data
+      openxlsx::addWorksheet(wb, "Data")
+      openxlsx::writeData(wb, "Data", kubus_df)
+      openxlsx::addStyle(wb, "Data", createStyle(numFmt = "0.000"), cols = which(names(kubus_df) %in% antwoordkolommen), 
+                         rows = 2:(nrow(kubus_df) + 1), gridExpand = TRUE)
+      
+      # 2) Data_def
+      openxlsx::addWorksheet(wb, "Data_def")
+      data_def_cols <- c("Jaar", "geolevel", "geoitem")
+      if (!isTRUE(args$geen_crossings) && args$crossings %in% names(kubus_df)) {
+        data_def_cols <- c(data_def_cols, args$crossings)
+      }
+      data_def_cols <- c(data_def_cols, antwoordkolommen, ong_col)
+      data_def_cols <- data_def_cols[data_def_cols %in% names(kubus_df)]
+      data_def <- data.frame(
+        col = data_def_cols,
+        type = c(
+          "period", "geolevel", "geoitem",
+          if (!isTRUE(args$geen_crossings) && args$crossings %in% names(kubus_df)) "dim" else NULL,
+          rep("var", sum(data_def_cols %in% antwoordkolommen) + as.integer(ong_col %in% data_def_cols))
+        )
+      )
+      openxlsx::writeData(wb, "Data_def", data_def)
+      
+      # 3) Label_var
+      openxlsx::addWorksheet(wb, "Label_var")
+      label_var <- data.frame(
+        Onderwerpcode = c(antwoordkolommen, ong_col),
+        Naam = c(paste0("Aantal ", ans_labels), "Totaal aantal ongewogen"),
+        Eenheid = rep("Personen", length(antwoordkolommen) + 1)
+      )
+      openxlsx::writeData(wb, "Label_var", label_var)
+      
+      # 4) Dimensies + items (alleen met crossings)
+      if (!isTRUE(args$geen_crossings) && args$crossings %in% colnames(data)) {
+        openxlsx::addWorksheet(wb, "Dimensies")
+        dim_naam <- labelled::var_label(data[[args$crossings]])
+        if (is.null(dim_naam) || is.na(dim_naam)) dim_naam <- args$crossings
+        openxlsx::writeData(
+          wb, "Dimensies",
+          data.frame(Dimensiecode = args$crossings, Naam = dim_naam)
+        )
+        
+        openxlsx::addWorksheet(wb, args$crossings)
+        cr_lbls <- labelled::val_labels(data[[args$crossings]])
+        if (is.null(cr_lbls) || length(cr_lbls) == 0) {
+          vals <- sort(unique(data[[args$crossings]]))
+          cr_lbls <- stats::setNames(as.character(vals), as.character(vals))
+        }
+        df_items <- data.frame(
+          Itemcode = unname(cr_lbls),
+          Naam = names(cr_lbls),
+          Volgnr = seq_along(cr_lbls)
+        )
+        openxlsx::writeData(wb, args$crossings, df_items)
+      }
+      
+      # 5) Indicators
+      openxlsx::addWorksheet(wb, "Indicators")
+      variabel_naam <- labelled::var_label(data[[args$vars]])
+      if (is.null(variabel_naam) || is.na(variabel_naam)) variabel_naam <- args$vars
+      
+      is_dichotoom <- suppressWarnings(all(as.numeric(ans_values) %in% c(0,1)) && length(ans_values) == 2)
+      
+      indicator_codes <- c(
+        antwoordkolommen,
+        ong_col,
+        paste0(args$vars, "_GEW"),
+        if (is_dichotoom) paste0(args$vars, "_perc") else paste0(args$vars, "_", ans_values, "_perc")
+      )
+      indicator_names <- c(
+        paste0("Aantal ", ans_labels),
+        "Totaal aantal ongewogen",
+        "Totaal aantal gewogen",
+        if (is_dichotoom) substr(variabel_naam, 1, max_char_labels)
+        else {
+          nm <- paste0(variabel_naam, ", ", ans_labels)
+          ifelse(nchar(nm) > max_char_labels, substr(nm, 1, max_char_labels), nm)
+        }
+      )
+      som_formule <- paste(antwoordkolommen, collapse = "+")
+      if (is_dichotoom) {
+        perc_formulas <- paste0("(", args$vars, "_1/(", som_formule, "))*100")
+        formulas <- c(rep("", length(ans_values) + 1), som_formule, perc_formulas)
+      } else {
+        perc_formulas <- vapply(ans_values, function(v) paste0("(", args$vars, "_", v, "/(", som_formule, "))*100"), character(1))
+        formulas <- c(rep("", length(ans_values) + 1), som_formule, perc_formulas)
+      }
+      
+      indicators_df <- data.frame(
+        `Indicator code` = indicator_codes,
+        Name = indicator_names,
+        Unit = c(rep("personen", length(ans_values) + 2),
+                 if (is_dichotoom) "percentage" else rep("percentage", length(ans_values))),
+        `Aggregation indicator` = c(rep("", length(ans_values) + 2),
+                                    if (is_dichotoom) paste0(args$vars, "_GEW") else rep(paste0(args$vars, "_GEW"), length(ans_values))),
+        Formula = formulas,
+        `Data type` = c(rep("Numeric", length(ans_values) + 2),
+                        if (is_dichotoom) "Percentage" else rep("Percentage", length(ans_values))),
+        Visible = c(rep(0, length(ans_values) + 2),
+                    if (is_dichotoom) 1 else rep(1, length(ans_values))),
+        `Threshold value` = c(rep("", length(ans_values) + 2),
+                              if (is_dichotoom) min_observaties else rep(min_observaties, length(ans_values))),
+        `Threshold Indicator` = c(rep("", length(ans_values) + 2),
+                                  if (is_dichotoom) paste0(args$vars, "_ONG") else rep(paste0(args$vars, "_ONG"), length(ans_values))),
+        Cube = c(rep(is_kubus, length(ans_values) + 2),
+                 if (is_dichotoom) is_kubus else rep(is_kubus, length(ans_values))),
+        Source = rep(bron, length(indicator_codes)),
+        check.names = FALSE
+      )
+      openxlsx::writeData(wb, "Indicators", indicators_df)
+      
+      # Opslaan in submap {output_folder}/{jaar}/{gebiedsniveau}
+      
+      if (is_kubus) {
+        out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), as.character(args$gebiedsniveau))
+        if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+        bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, "_", args$crossing, ".xlsx"))
+      } else {
+        out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), paste0(as.character(args$gebiedsniveau), "_totaal"))
+        if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+        bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, ".xlsx"))
+      }
+      
+      tryCatch({
+        openxlsx::saveWorkbook(wb, file = bestandsnaam, overwrite = TRUE)
+        msg("Kubusdata opgeslagen voor %s: %s", args$vars, bestandsnaam, level = MSG)
+      }, error = function(e) {
+        msg("Fout bij opslaan kubusdata voor %s: %s", args$vars, e$message, level = ERR)
+      })
+
     },
     .progress = TRUE
     )
   
-  
-  
-  
-  # # Data voorbereiden en aggregatie
-  # # We groeperen op jaar, gebied en het antwoord op de vraag (variabele)
-  # kubus_df <- data |>
-  #   filter(!is.na(.[[variabele]]), 
-  #          !is.na(.[[gebiedsindeling]]), 
-  #          !is.na(tbl_weegfactor)) |>
-  #   mutate(var = factor(.[[variabele]], 
-  #                       levels = val_labels(.[[variabele]]), 
-  #                       labels = names(val_labels(.[[variabele]])))) |>
-  #   group_by(tbl_jaar, .[[gebiedsindeling]], var) |>
-  #   summarise(
-  #     n_gewogen = sum(tbl_weegfactor, na.rm = TRUE),
-  #     n_ongewogen = n(),
-  #     .groups = "drop"
-  #   )
-  
-
-  
-  # Pivot naar breed formaat (platte structuur: 1 rij per gebied/jaar, kolommen per antwoord)
-  # Logica overgenomen uit global.R (geen_crossings == TRUE tak)
-  kubus_df <- kubus_df |>
-    mutate(across(.cols = n_ongewogen, min, .names = "n_cel")) |> # min gebruiken als placeholder
-    pivot_wider(names_from = var, values_from = c(n_gewogen, n_ongewogen), values_fill = 0) |>
-    rowwise() |>
-    # Totaal ongewogen berekenen door sommeren van de unpivoted kolommen
-    mutate(n_ongewogen = rowSums(across(starts_with("n_ongewogen")))) |>
-    select(-starts_with("n_ongewogen_")) |>
-    ungroup() |>
-    # Gewogen kolommen hernoemen (prefix 'n_gewogen_' verwijderen)
-    rename_with(~str_sub(.x, start=11), starts_with("n_gewogen")) |>
-    mutate(geolevel = "gemeente", .after = 1) # Aanname: niveau is gemeente (of regio), Swing vereist geolevel
-  
-  # Kolomnamen en volgorde herstellen
-  # Volgorde forceren op basis van labels
-  volgorde_labels <- names(val_labels(data[[variabele]]))
-  
-  # Huidige kolomindexen zoeken
-  volgorde_labels_in_df <- sapply(volgorde_labels, function(x) which(names(kubus_df) == x))
-  
-  # Correcte volgorde samenstellen: Jaar, Geolevel, Geoitem, [Antwoorden], Totaal Ongewogen
-  # Let op: afhankelijk van de pivot kan de volgorde variëren, dus we bouwen hem expliciet op
-  cols_base <- c("tbl_jaar", "geolevel", gebiedsindeling)
-  cols_answers <- names(val_labels(data[[variabele]])) # De antwoord categorieën
-  cols_total <- c("n_ongewogen")
-  
-  # Check of alle kolommen bestaan (soms vallen categorieën weg als er geen data is, pivot vult aan met 0 door values_fill maar levels moeten matchen)
-  # De pivot_wider maakt kolommen aan voor alle FACTOR levels die in de data zitten. Als levels empty zijn in de subset, maakt pivot ze niet aan tenzij drop=FALSE
-  # We moeten zeker weten dat de kolommen matchen met de labels
-  
-  missing_cols <- setdiff(cols_answers, names(kubus_df))
-  if(length(missing_cols) > 0){
-    for(mc in missing_cols) kubus_df[[mc]] <- 0
-  }
-  
-  kubus_df <- kubus_df |> select(all_of(c(cols_base, cols_answers, cols_total)))
-  
-  # Kolomnamen conform Swing formaat: Variabele_Label
-  nieuwe_namen_vars <- glue("{variabele}_{cols_answers}")
-  names(kubus_df) <- c("Period", "geolevel", "geoitem", nieuwe_namen_vars, glue("{variabele}_ONG"))
-  
-  # Privacy checks (kleine aantallen verwijderen)
-  verwijder_kleine_aantallen <- function(x, ongewogen){
-    if(ongewogen < min_observaties & ongewogen != missing_voor_privacy){missing_voor_privacy}else{x}
-  }
-  
-  # Toepassen privacy regels (in dit geval op basis van totaal ongewogen per rij)
-  # In global.R wordt dit complexer gedaan, hier vereenvoudigd voor platte data
-  # Als n_ongewogen < threshold, dan alle waarden op missing
-  kubus_df <- kubus_df |>
-    mutate(across(.cols = all_of(c(nieuwe_namen_vars, glue("{variabele}_ONG"))),
-                  .fns = ~ifelse(n_ongewogen < 0, missing_voor_privacy, .x))) # Placeholder logica, pas aan indien nodig
-  
-  
-  # Excel bestand opbouwen
-  wb <- createWorkbook()
-  
-  # 1. Sheet Data
-  addWorksheet(wb, sheetName = "Data")
-  writeData(wb, "Data", kubus_df)
-  
-  # 2. Sheet Data_def
-  addWorksheet(wb, sheetName = "Data_def")
-  data_def <- data.frame(
-    col = names(kubus_df),
-    type = c("period", "geolevel", "geoitem", rep("var", length(cols_answers) + 1))
-  )
-  writeData(wb, "Data_def", data_def)
-  
-  # Variabele metadata ophalen
-  variabel_labels <- val_labels(data[[variabele]])
-  is_dichotoom <- all(unname(variabel_labels) %in% c(0,1))
-  variabel_naam <- var_label(data[[variabele]])
-  if(is.null(variabel_naam)) variabel_naam <- variabele
-  
-  n_labels <- length(variabel_labels)
-  
-  # 3. Sheet Label_var
-  addWorksheet(wb, sheetName = "Label_var")
-  label_var <- data.frame(
-    Onderwerpcode = c(glue("{variabele}_{names(variabel_labels)}"), glue("{variabele}_ONG")),
-    Naam = c(glue("Aantal {names(variabel_labels)}"), "Totaal aantal ongewogen"),
-    Eenheid = "Personen"
-  )
-  writeData(wb, "Label_var", label_var)
-  
-  # 4. Sheet Indicators
-  addWorksheet(wb, sheetName = "Indicators")
-  
-  # Indicator codes opbouwen
-  indicator_codes <- c(
-    glue("{variabele}_{names(variabel_labels)}"), # Aantallen
-    glue("{variabele}_ONG"), # Ongewogen totaal
-    glue("{variabele}_GEW"), # Gewogen totaal (wordt berekend in formula)
-    if(is_dichotoom) { glue("{variabele}_perc") } else { glue("{variabele}_{names(variabel_labels)}_perc") } # Percentages
-  )
-  
-  # Indicator names
-  indicator_names <- c(
-    glue("Aantal {names(variabel_labels)}"),
-    "Totaal aantal ongewogen",
-    "Totaal aantal gewogen",
-    if(is_dichotoom) { substr(variabel_naam, 1, max_char_labels) } else { glue("{substr(variabel_naam,1,45)}, {names(variabel_labels)}") }
-  )
-  
-  # Formules
-  som_formule <- paste(glue("{variabele}_{names(variabel_labels)}"), collapse = "+")
-  
-  formulas <- c(
-    rep("", n_labels + 1), # Leeg voor aantallen + ongewogen
-    som_formule, # Gewogen totaal
-    if(is_dichotoom) {
-      glue("({variabele}_1/({som_formule}))*100")
-    } else {
-      glue("({variabele}_{names(variabel_labels)}/({som_formule}))*100")
-    }
-  )
-  
-  indicators_df <- data.frame(
-    `Indicator code` = indicator_codes,
-    Name = indicator_names,
-    Unit = c(rep("personen", n_labels + 2), if(is_dichotoom) "percentage" else rep("percentage", n_labels)),
-    `Aggregation indicator` = c(rep("", n_labels + 2), if(is_dichotoom) glue("{variabele}_GEW") else rep(glue("{variabele}_GEW"), n_labels)),
-    Formula = formulas,
-    `Data type` = c(rep("Numeric", n_labels + 2), if(is_dichotoom) "Percentage" else rep("Percentage", n_labels)),
-    Visible = c(rep(0, n_labels + 2), if(is_dichotoom) 1 else rep(1, n_labels)),
-    `Threshold value` = c(rep("", n_labels + 2), if(is_dichotoom) min_observaties else rep(min_observaties, n_labels)),
-    `Threshold Indicator` = c(rep("", n_labels + 2), if(is_dichotoom) glue("{variabele}_ONG") else rep(glue("{variabele}_ONG"), n_labels)),
-    Cube = is_kubus,
-    Source = bron,
-    check.names = FALSE
-  )
-  
-  writeData(wb, "Indicators", indicators_df)
-  
-  # Opslaan
-  bestandsnaam <- glue("{output_folder}/kubus_{variabele}.xlsx")
-  tryCatch({
-    saveWorkbook(wb, file = bestandsnaam, overwrite = TRUE)
-    msg("Kubusdata opgeslagen voor %s: %s", variabele, bestandsnaam, level = MSG)
-  }, error = function(e) {
-    msg("Fout bij opslaan kubusdata voor %s: %s", variabele, e$message, level = ERR)
-  })
 }
