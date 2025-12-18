@@ -38,14 +38,19 @@ MaakKubusData <- function(
   }
   
   # Check of crossing bestaan
-  crossings_niet_in_data <- crossings_niet_in_data <- crossings[!crossings %in% names(data)]
+  crossings_niet_in_data <- crossings[!crossings %in% names(data)]
   if (length(crossings_niet_in_data) > 0 |
       (length(crossings_niet_in_data) == 1 && crossings_niet_in_data == dummy_crossing_var)) {
     msg("Crossings %s niet gevonden in data voor kubus export.\r\n", paste(crossings_niet_in_data, collapse = ", "), level = WARN)
     return()
   }
-  # TODO: Controleren of variabelen niet in crossings voorkomen etc.
   
+  if (any(crossings %in% vars)) {
+    vars_in_crossing <- crossings[crossings %in% vars]
+    msg("Crossings %s komt/komen ook voor in vars. Dit levert problemen op dus wordt niet als var verwerkt.\r\n", vars_in_crossing, level = WARN)
+    rm(vars_in_crossing)
+    vars <- vars[!vars %in% crossings]
+  }
   
   
   # Controleer voor elke waarde in swing_configuraties$gebiedsindeling_kolom 
@@ -99,7 +104,7 @@ MaakKubusData <- function(
       args <- list(...)
       
       min_observaties <- algemeen$min_observaties_per_vraag
-      min_observaties_per_cel <- algemeen$min_observaties_per_cel
+      min_observaties_per_cel <- algemeen$min_observaties_per_antwoord
       bron <- args$bron
       is_kubus <- if (isTRUE(args$geen_crossings)) 0 else 1
       
@@ -175,7 +180,7 @@ MaakKubusData <- function(
       if (nrow(kubusdata) == 0) {
         if (is_kubus) {
           out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), as.character(args$gebiedsniveau))
-          bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, "_", args$crossing, ".xlsx"))
+          bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, "_", args$crossings, ".xlsx"))
         } else {
           out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), paste0(as.character(args$gebiedsniveau), "_totaal"))
           bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, ".xlsx"))
@@ -275,7 +280,7 @@ MaakKubusData <- function(
       # 1) Data
       openxlsx::addWorksheet(wb, "Data")
       openxlsx::writeData(wb, "Data", kubus_df)
-      openxlsx::addStyle(wb, "Data", createStyle(numFmt = "0.000"), cols = which(names(kubus_df) %in% antwoordkolommen), 
+      openxlsx::addStyle(wb, "Data", openxlsx::createStyle(numFmt = "0.000"), cols = which(names(kubus_df) %in% antwoordkolommen), 
                          rows = 2:(nrow(kubus_df) + 1), gridExpand = TRUE)
       
       # 2) Data_def
@@ -316,7 +321,11 @@ MaakKubusData <- function(
         )
         
         openxlsx::addWorksheet(wb, args$crossings)
-        cr_lbls <- labelled::val_labels(data[[args$crossings]])
+        if (args$crossings %in% names(data) && "labelled" %in% class(data[[args$crossings]])) {
+          cr_lbls <- labelled::val_labels(data[[args$crossings]])
+        } else {
+          cr_lbls <- NULL
+        }
         if (is.null(cr_lbls) || length(cr_lbls) == 0) {
           vals <- sort(unique(data[[args$crossings]]))
           cr_lbls <- stats::setNames(as.character(vals), as.character(vals))
