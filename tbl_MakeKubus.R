@@ -17,7 +17,25 @@ MaakKubusData <- function(
   if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
   
   
-  vars <- unique(variabelen$variabelen)
+  # Variabelen prepareren / ontdubbelen
+  vars_df <- variabelen
+  if (any(duplicated(vars_df$variabelen))) {
+    vars_df <- vars_df |> dplyr::distinct()
+  }
+  
+  # Weegfactor kolommen uit variabelen hernoemen zodat ze niet botsen met configuratie
+  # en makkelijk terug te vinden zijn
+  wf_cols <- grep("^weegfactor", names(vars_df), value=TRUE)
+  if (length(wf_cols) > 0) {
+    vars_df <- vars_df |> dplyr::rename_with(~paste0("var_", .), dplyr::all_of(wf_cols))
+  }
+  
+  # Hernoemen van de variabele kolom naar 'vars' om consistent te blijven met de rest van het script
+  if ("variabelen" %in% names(vars_df)) {
+    vars_df <- vars_df |> dplyr::rename(vars = variabelen)
+  }
+  
+  vars <- unique(vars_df$vars)
   
   if (missing(crossings) || is.null(crossings)) {
     crossings <- c()
@@ -90,9 +108,9 @@ MaakKubusData <- function(
   crossings <- unique(c(crossings, dummy_crossing_var)) 
   
   # Combinatie maken tussen elke configuratie regel, variabele en crossing variabelen
-  configs <- expand_grid(
+  configs <- tidyr::expand_grid(
     configuraties,
-    vars,
+    vars_df,
     crossings
   )
   
@@ -118,6 +136,25 @@ MaakKubusData <- function(
       bron <- args$bron
       is_kubus <- if (isTRUE(args$geen_crossings)) 0 else 1
       
+      # Weegfactor bepalen
+      # 1. Standaard uit configuratie
+      # 2. Override uit variabelen (var_weegfactor)
+      # 3. Override voor specifieke dataset (var_weegfactor.d[id] of var_weegfactor.d_[naam])
+      
+      current_weegfactor <- args$weegfactor
+      
+      # Check overrides
+      ds_name_col <- paste0("var_weegfactor.d_", args$naam_dataset)
+      ds_id_col <- paste0("var_weegfactor.d", args$tbl_dataset)
+      global_col <- "var_weegfactor"
+      
+      if (!is.null(args[[ds_name_col]]) && !is.na(args[[ds_name_col]])) {
+        current_weegfactor <- args[[ds_name_col]]
+      } else if (!is.null(args[[ds_id_col]]) && !is.na(args[[ds_id_col]])) {
+        current_weegfactor <- args[[ds_id_col]]
+      } else if (!is.null(args[[global_col]]) && !is.na(args[[global_col]])) {
+        current_weegfactor <- args[[global_col]]
+      }
       
       
       
@@ -171,7 +208,7 @@ MaakKubusData <- function(
       kubusdata <- kubusdata |>
         dplyr::filter(!is.na(.data$geoitem),
                       !is.na(.data[[args$vars]]),
-                      !is.na(.data[[args$weegfactor]]))
+                      !is.na(.data[[current_weegfactor]]))
       
       # Alleen crossing filteren wanneer use_crossing == TRUE
       if (use_crossing) {
@@ -182,7 +219,7 @@ MaakKubusData <- function(
       kubusdata <- kubusdata |> 
         group_by(across(all_of(c(grouping_cols, args$vars)))) |> 
         summarise(
-          n_gewogen = sum(!!sym(args$weegfactor), na.rm = TRUE),
+          n_gewogen = sum(!!sym(current_weegfactor), na.rm = TRUE),
           n_ongewogen = n(),
           .groups = "drop"
         )
