@@ -769,7 +769,7 @@ log.save = T
   # dummyvariabelen maken voor iedere kolom
   # dit is nodig om later een chi square uit te kunnen voeren over een vergelijkingsset, omdat survey pure pijn is
   # daarnaast maken we van het moment gebruik om de aantallen even op te slaan
-  n_resp = data.frame()
+  n_resp_list <- list() # Initialiseer lijst
   for (i in 1:nrow(kolom_opbouw)) {
     kolom = data$tbl_dataset == kolom_opbouw$dataset[i]
     # scheiden per jaar?
@@ -783,7 +783,7 @@ log.save = T
     
     data[,paste0("dummy._col", i)] = kolom
     
-    n_resp = bind_rows(n_resp, data.frame(col=i, year=kolom_opbouw$year[i], crossing=kolom_opbouw$crossing[i], n=sum(kolom, na.rm=T)))
+    n_resp_list[[i]] <- data.frame(col=i, year=kolom_opbouw$year[i], crossing=kolom_opbouw$crossing[i], n=sum(kolom, na.rm=T))
     
     # ook splitsen per subset?
     if (!is.na(kolom_opbouw$subset[i])) {
@@ -797,10 +797,11 @@ log.save = T
         if (sum(subset, na.rm=T) <= 0) next # als er geen data bestaat voor die subset is het een beetje nutteloos
         data[,paste0("dummy._col", i, ".s.", unname(val))] = subset
         
-        n_resp = bind_rows(n_resp, data.frame(col=i, year=kolom_opbouw$year[i], crossing=kolom_opbouw$crossing[i], subset=val, n=sum(subset, na.rm=T)))
+        n_resp_list[[i]] <- bind_rows(n_resp_list[[i]], data.frame(col=i, year=kolom_opbouw$year[i], crossing=kolom_opbouw$crossing[i], subset=val, n=sum(subset, na.rm=T)))
       }
     }
   }
+  n_resp <- bind_rows(n_resp_list)
   # het kan voorkomen dat geen van de kolommen een subset hebben, maar hier wordt in latere functies wel gebruik van gemaakt... indien missend, voeg toe
   if (!"subset" %in% colnames(n_resp)) {
     n_resp$subset = NA
@@ -904,9 +905,27 @@ log.save = T
   
   if (calc.results) {
     source(paste0(dirname(this.path()), "/tbl_GetTableRow.R"))
-    results = data.frame()
+    results_list = list()
     t.start = proc.time()["elapsed"]
     t.vars = c()
+    
+    # Caching voor svydesign (optimalisatie)
+    last_weight_config <- NULL
+    current_design <- NULL
+    
+    # Basis variabelen bepalen (die altijd in het design moeten zitten)
+    base_vars_names <- c(kolom_opbouw$crossing, kolom_opbouw$subset, colnames(data)[str_starts(colnames(data), "dummy._col")],
+                   "superstrata", "superweegfactor", "fpc", "tbl_dataset", weight.factors)
+    base_vars_names <- unique(base_vars_names[!is.na(base_vars_names)])
+    
+    # Weegfactor logica voorbereiden
+    has_weight_logic <- any(str_detect(colnames(varlist), "weegfactor"))
+    weegfactorvars <- NULL
+    if (has_weight_logic) {
+         weegfactorvars = str_match(colnames(varlist), "weegfactor(.*)")
+         weegfactorvars = matrix(weegfactorvars[!is.na(weegfactorvars[,1]),], ncol=2)
+    }
+    
     for (i in 1:nrow(varlist)) {
       var = varlist$inhoud[i]
       
@@ -915,68 +934,84 @@ log.save = T
         next
       }
       
-      # we kunnen de dataset die de functie in moet flink verkleinen; alle variabelen
-      # behalve [var], dummy._col[1:n], dummy.[var], de subsets en de crossings kunnen eruit
-      vars = c(var, kolom_opbouw$crossing, kolom_opbouw$subset, colnames(data)[str_starts(colnames(data), "dummy._col")],
-               colnames(data)[str_starts(colnames(data), paste0("dummy.", var))], "superstrata", "superweegfactor", "fpc",
-               "tbl_dataset", weight.factors)
-      vars = unique(vars[!is.na(vars)])
-      data.tmp = data %>% select(any_of(vars))
+      # 1. Bepaal Weight Config Key voor caching
+      current_weight_config <- "default"
+      if (has_weight_logic) {
+         current_vals <- c()
+         for(k in 1:nrow(weegfactorvars)) {
+             wfname <- weegfactorvars[k,1]
+             val <- varlist[[wfname]][i]
+             if(!is.na(val)) current_vals <- c(current_vals, paste(wfname, val, sep="="))
+         }
+         if(length(current_vals) > 0) {
+             current_weight_config <- paste(sort(current_vals), collapse="|")
+         }
+      }
       
-      # nu wordt het ingewikkeld: in de monitor VO zijn verschillende weegfactoren nodig per jaar
-      # dit betekent dat we per variabele EN per dataset een andere weegfactor kunnen hebben
-      # daarvoor kan een combinatieweegfactor gemaakt worden, als er gewerkt wordt met één groot combinatiebestand,
-      # of er kan een 'superweegfactor' gemaakt worden, gelijkend aan de superweegfactor die door combinatie hierboven ontstaan is
-      # aangezien niet alle GGD'en een overkoepelend bestand hebben is hier gekozen voor de tweede optie
-      # gezien de complexiteit wordt deze code lelijk, daar is helaas weinig aan te doen
+      # Variabelen specifiek voor deze var
+      current_var_cols <- c(var, colnames(data)[str_starts(colnames(data), paste0("dummy.", var))])
+      current_var_cols <- current_var_cols[current_var_cols %in% colnames(data)]
       
-      if (any(str_detect(colnames(varlist), "weegfactor"))) {
-        # tijd om te huilen
-        # mogelijke opties:
-        # "weegfactor" -> override voor die variabele
-        # "weegfactor.d[getal]" -> override voor die variabele in dataset [getal]
-        # "weegfactor.d_[naam]" -> override voor die variabele in dataset [naam]
-        weegfactorvars = str_match(colnames(varlist), "weegfactor(.*)")
-        weegfactorvars = matrix(weegfactorvars[!is.na(weegfactorvars[,1]),], ncol=2) # het moet via een matrix met 2 kolommen, omdat R anders een enkele rij omzet naar een vector
-        
-        for (j in 1:nrow(weegfactorvars)) {
-          wfname = weegfactorvars[j,1]
-          wfdataset = weegfactorvars[j,2]
-          
-          if (wfname == "weegfactor" && !is.na(varlist$weegfactor[i])) {
-            data.tmp$superweegfactor = data.tmp[[varlist$weegfactor[i]]]
-          } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d(\\d+)$")) { # numeriek, dus d[getal]
-            dataset = as.numeric(str_match(wfdataset, "(\\d+)")[,2])
-            data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
-          } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d_(.+)")) { # naam van een dataset
-            dataset = str_match(wfdataset, "^\\.d_(.+)")[,2]
-            if (!dataset %in% datasets$naam_dataset) {
-              msg("Er is een weegfactor opgegeven in indeling_rijen voor dataset %s, maar deze dataset is niet bekend. Controleer de configuratie.", dataset, level=ERR)
-            }
-            dataset = which(datasets$naam_dataset == dataset)
-            data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
-          } else if (!is.na(varlist[[wfname]][i])) {
-            msg("Onbekende weegfactordefinitie opgegeven: %s. Controleer de configuratie.", wfname, level=ERR)
+      # 2. Check Cache
+      if (!is.null(current_design) && identical(current_weight_config, last_weight_config)) {
+          # CACHE HIT: Update design
+          for(col in current_var_cols) {
+              current_design$variables[[col]] <- data[[col]]
           }
-        }
-      }
-      
-      # aanmaken van design, afhankelijk van of er fpc is.
-      if("fpc" %in% colnames(datasets)){
-        design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, fpc=~fpc, data=data.tmp)  
       } else {
-        design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, data=data.tmp)
+          # CACHE MISS: Nieuw design
+          vars_to_select <- unique(c(base_vars_names, current_var_cols))
+          data.tmp <- data %>% select(any_of(vars_to_select))
+          
+          # Weegfactor logica
+          if (has_weight_logic && length(current_weight_config) > 0 && current_weight_config != "default") {
+            for (j in 1:nrow(weegfactorvars)) {
+              wfname = weegfactorvars[j,1]
+              wfdataset = weegfactorvars[j,2]
+              
+              if (wfname == "weegfactor" && !is.na(varlist$weegfactor[i])) {
+                data.tmp$superweegfactor = data.tmp[[varlist$weegfactor[i]]]
+              } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d(\\d+)$")) { 
+                dataset = as.numeric(str_match(wfdataset, "(\\d+)")[,2])
+                data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
+              } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d_(.+)")) { 
+                dataset = str_match(wfdataset, "^\\.d_(.+)")[,2]
+                if (!dataset %in% datasets$naam_dataset) {
+                  msg("Er is een weegfactor opgegeven in indeling_rijen voor dataset %s, maar deze dataset is niet bekend. Controleer de configuratie.", dataset, level=ERR)
+                }
+                dataset = which(datasets$naam_dataset == dataset)
+                data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
+              } else if (!is.na(varlist[[wfname]][i])) {
+                 msg("Onbekende weegfactordefinitie opgegeven: %s. Controleer de configuratie.", wfname, level=ERR)
+              }
+            }
+          }
+          
+          if("fpc" %in% colnames(datasets)){
+            current_design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, fpc=~fpc, data=data.tmp)  
+          } else {
+            current_design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, data=data.tmp)
+          }
+          
+          last_weight_config <- current_weight_config
       }
-      
       
       t.before = proc.time()["elapsed"]
-      results = bind_rows(results, GetTableRow(var, design, kolom_opbouw, subsetmatches))
+      results_list[[i]] = GetTableRow(var, current_design, kolom_opbouw, subsetmatches)
       t.after = proc.time()["elapsed"]
       t.vars = c(t.vars, t.after-t.before)
       
       msg("Variabele %d/%d berekend; rekentijd %0.1f sec.", i, nrow(varlist), t.after-t.before, level=MSG)
       
+      # Design weer schoonmaken voor volgende iteratie (geheugenmanagement)
+      for(col in current_var_cols) {
+          if(!col %in% base_vars_names) {
+              current_design$variables[[col]] <- NULL
+          }
+      }
     }
+    
+    results = bind_rows(results_list)
     t.end = proc.time()["elapsed"]
     msg("Totale rekentijd %0.2f min voor %d variabelen. Gemiddelde tijd per variabele was %0.1f sec (range %0.1f - %0.1f).",
         (t.end-t.start)/60, nrow(varlist), mean(t.vars), min(t.vars), max(t.vars), level=MSG)
