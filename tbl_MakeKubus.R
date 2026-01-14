@@ -5,6 +5,7 @@ MaakKubusData <- function(
     data,
     configuraties,
     variabelen,
+    crossings,
     output_bestandsnaam_prefix = "kubusdata",
     output_folder = "output_swing",
     missing_voor_privacy = -99996,
@@ -17,7 +18,13 @@ MaakKubusData <- function(
   
   
   vars <- unique(variabelen$variabelen)
-  crossings <- unique(variabelen$crossings)
+  
+  if (missing(crossings) || is.null(crossings)) {
+    crossings <- c()
+  } else if (is.data.frame(crossings)) {
+    crossings <- crossings[[1]]
+  }
+  crossings <- unique(crossings)
   
   gebiedsniveaus <- unique(configuraties$gebiedsniveau)
   # gebiedsindelingen <- unique(configuraties$gebiedsindeling_kolom)

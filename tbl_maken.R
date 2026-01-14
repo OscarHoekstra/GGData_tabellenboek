@@ -85,8 +85,13 @@ log.save = T
   # daadwerkelijk inlezen configuratie
   # TODO: onmogelijke waardes checken
   sheets = c("algemeen", "crossings", "datasets", "indeling_rijen", "onderdelen", "opmaak", "labelcorrectie", "logos", "intro_tekst", "headers_afkortingen",
-             "dichotoom", "niet_dichotoom", "forceer_datatypen", "swing_configuraties", "swing_variabelen")
+             "dichotoom", "niet_dichotoom", "forceer_datatypen", "swing_configuraties", "swing_variabelen", "swing_crossings")
+  
+  available_sheets <- getSheetNames(config.file)
+  
   for (sheet in sheets) {
+    if (!sheet %in% available_sheets) next
+    
     tmp = read.xlsx(config.file, sheet=sheet)
     
     # om de configuratielast te verlichten is het mogelijk om tabbladen over te erven uit andere configuraties
@@ -993,7 +998,8 @@ log.save = T
   if (algemeen$swing_output) {
     MaakKubusData(data = data,
                   configuraties = swing_configuraties,
-                  variabelen = swing_variabelen)
+                  variabelen = swing_variabelen,
+                  crossings = if(exists("swing_crossings")) swing_crossings else NULL)
   }
   
   
