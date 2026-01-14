@@ -95,8 +95,11 @@ MaakKubusData <- function(
   
   # Bij geen_crossings alles behalve dummy var weghalen
   configs <- configs |> 
-    filter(!(isTRUE(geen_crossings) & crossings != dummy_crossing_var))
+    filter(!(geen_crossings == TRUE & crossings != dummy_crossing_var))
   
+  # Bij wel crossings dummy var weghalen
+  configs <- configs |> 
+    filter(!(geen_crossings == FALSE & crossings == dummy_crossing_var))
   
   # Over elke regel van de config lopen om de platte kubusdata te maken
   configs |> 
