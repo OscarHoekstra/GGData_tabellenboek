@@ -6,15 +6,30 @@ MaakKubusData <- function(
     configuraties,
     variabelen,
     crossings,
+    algemeen = NULL,
+    afkapwaarde = -99996,
     output_bestandsnaam_prefix = "kubusdata",
     output_folder = "output_swing",
-    missing_voor_privacy = -99996,
     max_char_labels = 100,
     dummy_crossing_var = "dummy_crossing"
 ) {
   
   # Check of output map bestaat
   if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+  
+  if (is.null(algemeen) && exists("algemeen")) {
+    algemeen <- get("algemeen")
+  }
+  
+  min_obs_vraag <- if(!is.null(algemeen$min_observaties_per_vraag)) as.numeric(algemeen$min_observaties_per_vraag) else 0
+  min_obs_cel   <- if(!is.null(algemeen$min_observaties_per_antwoord)) as.numeric(algemeen$min_observaties_per_antwoord) else 0
+  
+  if (is.null(algemeen$swing_afkapwaarde) && !is.na(algemeen$swing_afkapwaarde)) {
+    afkapwaarde <- as.numeric(algemeen$swing_afkapwaarde)
+    msg("Afkapwaarde voor swing opgehaald uit config: %s", afkapwaarde, level = MSG)
+  }
+  
+
   
   
   # Variabelen prepareren / ontdubbelen
@@ -130,9 +145,7 @@ MaakKubusData <- function(
   configs |> 
     pwalk(function(...){
       args <- list(...)
-      
-      min_observaties <- algemeen$min_observaties_per_vraag
-      min_observaties_per_cel <- algemeen$min_observaties_per_antwoord
+      browser()
       bron <- args$bron
       is_kubus <- if (isTRUE(args$geen_crossings)) 0 else 1
       
@@ -296,22 +309,22 @@ MaakKubusData <- function(
       data_cols <- c(base_cols, antwoordkolommen, ong_col)
       data_cols <- data_cols[data_cols %in% names(kubusdata)]
       
-      # Privacy: rijniveau (ONG < min_observaties) -> alle waarden missing
-      rij_te_weinig <- kubusdata[[ong_col]] < min_observaties & kubusdata[[ong_col]] != missing_voor_privacy
+      # Privacy: rijniveau (ONG < min_obs_vraag) -> alle waarden missing
+      rij_te_weinig <- kubusdata[[ong_col]] < min_obs_vraag & kubusdata[[ong_col]] != afkapwaarde
       if (any(rij_te_weinig, na.rm = TRUE)) {
-        kubusdata[rij_te_weinig, antwoordkolommen] <- missing_voor_privacy
-        kubusdata[rij_te_weinig, ong_col] <- missing_voor_privacy
+        kubusdata[rij_te_weinig, antwoordkolommen] <- afkapwaarde
+        kubusdata[rij_te_weinig, ong_col] <- afkapwaarde
       }
       
-      # Privacy: celniveau (n_ongewogen_<code> < min_observaties_per_cel) -> alleen die cel missing
-      if (min_observaties_per_cel > 0) {
+      # Privacy: celniveau (n_ongewogen_<code> < min_obs_cel) -> alleen die cel missing
+      if (min_obs_cel > 0) {
         for (i in seq_along(ans_values)) {
           cel_u_col <- ongewogen_celkolommen[i]
           cel_w_col <- antwoordkolommen[i]
           if (cel_u_col %in% names(kubusdata) && cel_w_col %in% names(kubusdata)) {
-            mask <- kubusdata[[cel_u_col]] < min_observaties_per_cel & kubusdata[[cel_u_col]] != missing_voor_privacy
+            mask <- kubusdata[[cel_u_col]] < min_obs_cel & kubusdata[[cel_u_col]] != afkapwaarde
             if (any(mask, na.rm = TRUE)) {
-              kubusdata[mask, cel_w_col] <- missing_voor_privacy
+              kubusdata[mask, cel_w_col] <- afkapwaarde
             }
           }
         }
@@ -327,7 +340,8 @@ MaakKubusData <- function(
       # 1) Data
       openxlsx::addWorksheet(wb, "Data")
       openxlsx::writeData(wb, "Data", kubus_df)
-      openxlsx::addStyle(wb, "Data", openxlsx::createStyle(numFmt = "0.000"), cols = which(names(kubus_df) %in% antwoordkolommen), 
+      style_fmt <- openxlsx::createStyle(numFmt = "[=-99996]0;0.000")
+      openxlsx::addStyle(wb, "Data", style_fmt, cols = which(names(kubus_df) %in% antwoordkolommen), 
                          rows = 2:(nrow(kubus_df) + 1), gridExpand = TRUE)
       
       # 2) Data_def
@@ -430,7 +444,7 @@ MaakKubusData <- function(
         Visible = c(rep(0, length(ans_values) + 2),
                     if (is_dichotoom) 1 else rep(1, length(ans_values))),
         `Threshold value` = c(rep("", length(ans_values) + 2),
-                              if (is_dichotoom) min_observaties else rep(min_observaties, length(ans_values))),
+                              if (is_dichotoom) min_obs_vraag else rep(min_obs_vraag, length(ans_values))),
         `Threshold Indicator` = c(rep("", length(ans_values) + 2),
                                   if (is_dichotoom) paste0(args$vars, "_ONG") else rep(paste0(args$vars, "_ONG"), length(ans_values))),
         Cube = c(rep(is_kubus, length(ans_values) + 2),
