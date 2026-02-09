@@ -13,23 +13,21 @@ MaakKubusData <- function(
     max_char_labels = 100,
     dummy_crossing_var = "dummy_crossing"
 ) {
-  
+
   # Check of output map bestaat
   if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
   
-  if (is.null(algemeen) && exists("algemeen")) {
-    algemeen <- get("algemeen")
+  if (is.null(algemeen) && exists("algemeen", envir = .GlobalEnv)) {
+    algemeen <- get("algemeen", envir = .GlobalEnv)
   }
   
   min_obs_vraag <- if(!is.null(algemeen$min_observaties_per_vraag)) as.numeric(algemeen$min_observaties_per_vraag) else 0
   min_obs_cel   <- if(!is.null(algemeen$min_observaties_per_antwoord)) as.numeric(algemeen$min_observaties_per_antwoord) else 0
   
-  if (is.null(algemeen$swing_afkapwaarde) && !is.na(algemeen$swing_afkapwaarde)) {
+  if (!is.na(algemeen$swing_afkapwaarde)) {
     afkapwaarde <- as.numeric(algemeen$swing_afkapwaarde)
     msg("Afkapwaarde voor swing opgehaald uit config: %s", afkapwaarde, level = MSG)
   }
-  
-
   
   
   # Variabelen prepareren / ontdubbelen
@@ -145,7 +143,6 @@ MaakKubusData <- function(
   configs |> 
     pwalk(function(...){
       args <- list(...)
-      browser()
       bron <- args$bron
       is_kubus <- if (isTRUE(args$geen_crossings)) 0 else 1
       

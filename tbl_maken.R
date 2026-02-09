@@ -206,37 +206,45 @@ log.save = T
   } else {
     algemeen$swing_output[is.na(algemeen$swing_output)] = FALSE
   }
-  if (algemeen$swing_output && (!"swing_output_bestandsnaam" %in% colnames(algemeen) || is.na(algemeen$swing_output_bestandsnaam))) {
-    algemeen$swing_output_bestandsnaam <- "kubusdata"
-    msg("Er is geen naam voor het swing/platte_kubus output bestand gegeven. Standaardnaam ('kubusdata') wordt aangenomen.", level=WARN)
+  
+  # Als swing output wel gemaakt wordt, moeten we nog een aantal dingen checken en aanvullen:
+  if (algemeen$swing_output) {
+    
+    if (any(!c("swing_configuraties", "swing_variabelen", "swing_crossings") %in% available_sheets)) {
+      msg("Er is aangegeven dat er een swing output gemaakt moet worden, maar de benodigde tabbladen swing_configuraties, swing_variabelen, en swing_crossings zijn niet allemaal aanwezig. Controleer de configuratie.", level=ERR)
+    }
+    
+    if (!"swing_output_bestandsnaam" %in% colnames(algemeen) || is.na(algemeen$swing_output_bestandsnaam)) {
+      algemeen$swing_output_bestandsnaam <- "kubusdata"
+      msg("Er is geen naam voor het swing/platte_kubus output bestand gegeven. Standaardnaam ('kubusdata') wordt aangenomen.", level=WARN)
+    }
+    
+    if (!"swing_afkapwaarde" %in% colnames(algemeen)) {
+      algemeen$swing_afkapwaarde <- NA
+    }
+    
+    # Swing_configuraties$gebiedsniveau mag niet leeg zijn
+    if (any(is.na(swing_configuraties$gebiedsniveau))) {
+      msg("In tabblad swing_configuraties is het gebiedsniveau niet ingevuld op rij(s) %s. Vul dit in, dit is verplicht voor swing analyses.",
+          str_c(which(is.na(swing_configuraties$gebiedsniveau)), collapse=", "), level=ERR)
+    }
+    
+    # Swing_configuratie tbl_dataset toevoegen als rijnummer van datasets,
+    # om dit later te kunnen gebruiken bij het bouwen van de swing data als filter
+    # (Alternatief zou zijn de dataset_naam aan data toe tevoegen)
+    replace_empty_with_na <- function(x) {if (length(x) == 0) return(NA_integer_) else return(x)}
+    swing_configuraties <- swing_configuraties |> 
+      rowwise() |> 
+      mutate(
+        tbl_dataset = replace_empty_with_na(which(datasets$naam_dataset == naam_dataset))
+      ) |> 
+      ungroup()
+    
+    swing_configuraties <- left_join(swing_configuraties, datasets, by = "naam_dataset")
+    
   }
 
   
-  
-  
-  # Swing_configuraties aanvullen met de nodige informatie uit datasets
-  
-  # Swing_configuraties$gebiedsniveau mag niet leeg zijn
-  if (any(is.na(swing_configuraties$gebiedsniveau))) {
-    msg("In tabblad swing_configuraties is het gebiedsniveau niet ingevuld op rij(s) %s. Vul dit in, dit is verplicht voor swing analyses.",
-        str_c(which(is.na(swing_configuraties$gebiedsniveau)), collapse=", "), level=ERR)
-  }
-  
-  
-  # Swing_configuratie tbl_dataset toevoegen als rijnummer van datasets,
-  # om dit later te kunnen gebruiken bij het bouwen van de swing data als filter
-  # (Alternatief zou zijn de dataset_naam aan data toe tevoegen)
-  replace_empty_with_na <- function(x) {if (length(x) == 0) return(NA_integer_) else return(x)}
-   swing_configuraties <- swing_configuraties |> 
-    rowwise() |> 
-    mutate(
-      tbl_dataset = replace_empty_with_na(which(datasets$naam_dataset == naam_dataset))
-      ) |> 
-    ungroup()
-  
-  swing_configuraties <- left_join(swing_configuraties, datasets, by = "naam_dataset")
-   
-   
   # variabelelijst afleiden uit de indeling van het tabellenboek;
   # iedere regel met (n)var is een variabele die we nodig hebben
   varlist = indeling_rijen[indeling_rijen$type %in% c("var", "nvar"),]
@@ -1034,7 +1042,7 @@ log.save = T
     MaakKubusData(data = data,
                   configuraties = swing_configuraties,
                   variabelen = swing_variabelen,
-                  crossings = if(exists("swing_crossings")) swing_crossings else NULL)
+                  crossings = swing_crossings)
   }
   
   
