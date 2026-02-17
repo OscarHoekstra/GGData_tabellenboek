@@ -1,5 +1,6 @@
-# Functie voor het maken van platte kubusdata voor Swing (ABF)
-# Gebaseerd op de logica uit swing_kubusdata_wizard/global.R
+# Functie voor het maken van platte kubusdata voor Swing (ABF).
+# Doel: gestandaardiseerde output voor Swing, inclusief labels en dimensies.
+library(data.table)
 
 MaakKubusData <- function(
     data,
@@ -13,43 +14,46 @@ MaakKubusData <- function(
     max_char_labels = 100,
     dummy_crossing_var = "dummy_crossing"
 ) {
-
-  # Check of output map bestaat
+  
+  # Outputmap aanmaken indien nodig zodat schrijfacties nooit falen op ontbrekende paden.
   if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
   
+  # Config uit de globale omgeving gebruiken wanneer die niet expliciet is meegegeven.
+  # Dit behoudt backward compatibility met bestaande scripts.
   if (is.null(algemeen) && exists("algemeen", envir = .GlobalEnv)) {
     algemeen <- get("algemeen", envir = .GlobalEnv)
   }
   
+  # Drempels voor privacy-masking: rijniveau (vraag) en celniveau (antwoord).
   min_obs_vraag <- if(!is.null(algemeen$min_observaties_per_vraag)) as.numeric(algemeen$min_observaties_per_vraag) else 0
   min_obs_cel   <- if(!is.null(algemeen$min_observaties_per_antwoord)) as.numeric(algemeen$min_observaties_per_antwoord) else 0
   
+  # Afkapwaarde uit config overschrijft standaardwaarde zodat masking consistent is met Swing.
   if (!is.na(algemeen$swing_afkapwaarde)) {
     afkapwaarde <- as.numeric(algemeen$swing_afkapwaarde)
     msg("Afkapwaarde voor swing opgehaald uit config: %s", afkapwaarde, level = MSG)
   }
   
-  
-  # Variabelen prepareren / ontdubbelen
+  # Variabelen voorbereiden en ontdubbelen om dubbele rijen in configs te voorkomen.
   vars_df <- variabelen
   if (any(duplicated(vars_df$variabelen))) {
     vars_df <- vars_df |> dplyr::distinct()
   }
-  
   # Weegfactor kolommen uit variabelen hernoemen zodat ze niet botsen met configuratie
-  # en makkelijk terug te vinden zijn
+  # en altijd terug te vinden zijn in de config-rij.
   wf_cols <- grep("^weegfactor", names(vars_df), value=TRUE)
   if (length(wf_cols) > 0) {
     vars_df <- vars_df |> dplyr::rename_with(~paste0("var_", .), dplyr::all_of(wf_cols))
   }
   
-  # Hernoemen van de variabele kolom naar 'vars' om consistent te blijven met de rest van het script
+  # Hernoemen van de variabele kolom naar 'vars' voor consistente verwijzingen.
   if ("variabelen" %in% names(vars_df)) {
     vars_df <- vars_df |> dplyr::rename(vars = variabelen)
   }
   
   vars <- unique(vars_df$vars)
   
+  # Crossings normaliseren naar een karaktervector (ook wanneer input een data.frame is).
   if (missing(crossings) || is.null(crossings)) {
     crossings <- c()
   } else if (is.data.frame(crossings)) {
@@ -57,18 +61,17 @@ MaakKubusData <- function(
   }
   crossings <- unique(crossings)
   
+  # Dimensies uit configuratie ophalen om outputpaden te bouwen.
   gebiedsniveaus <- unique(configuraties$gebiedsniveau)
-  # gebiedsindelingen <- unique(configuraties$gebiedsindeling_kolom)
   jaren <- unique(configuraties$jaar_voor_analyse)
-  # TODO: Misschien moeten we controleren of variabelen/crossings uniek zijn (ipv uniek maken)
   
-  # NA verwijderen
+  # NA verwijderen zodat latere selects en filters geen fouten geven.
   vars <- vars[!is.na(vars)] 
   crossings <- crossings[!is.na(crossings)] 
   jaren <- jaren[!is.na(jaren)]
   
   
-  # Check of variabelen bestaan
+  # Check of variabelen bestaan om vroegtijdig te stoppen met duidelijke melding.
   vars_niet_in_data <- vars[!vars %in% names(data)]
   if (length(vars_niet_in_data) > 0) {
     msg("Variabele %s niet gevonden in data voor kubus export.\r\n", paste(vars_niet_in_data, collapse = ", "), level = WARN)
@@ -77,8 +80,8 @@ MaakKubusData <- function(
   
   # Check of crossing bestaan
   crossings_niet_in_data <- crossings[!crossings %in% names(data)]
-  if (length(crossings_niet_in_data) > 0 |
-      (length(crossings_niet_in_data) == 1 && crossings_niet_in_data == dummy_crossing_var)) {
+  if (length(crossings_niet_in_data) > 0 &&
+      !(length(crossings_niet_in_data) == 1 && crossings_niet_in_data == dummy_crossing_var)) {
     msg("Crossings %s niet gevonden in data voor kubus export.\r\n", paste(crossings_niet_in_data, collapse = ", "), level = WARN)
     return()
   }
@@ -91,10 +94,8 @@ MaakKubusData <- function(
   }
   
   
-  # Controleer voor elke waarde in swing_configuraties$gebiedsindeling_kolom 
-  # of deze kolomnaam voorkomt in data. Vervang kolomnamen die niet bestaan 
-  # door NA en geef een waarschuwing. Houd de oorspronkelijke vectorstructuur 
-  # (inclusief bestaande NA's) exact intact
+  # Controleer per gebiedsindeling of de kolom bestaat.
+  # Niet-bestaande kolommen worden NA zodat downstream code voorspelbaar blijft.
   gebiedsindelingen_kolom <- sapply(configuraties$gebiedsindeling_kolom, function(kolomnaam) {
     if (is.na(kolomnaam)) {
       return(NA)
@@ -107,6 +108,7 @@ MaakKubusData <- function(
     }
   })
   
+  # Zorg dat outputmappen bestaan voor alle jaar/gebiedsniveau combinaties.
   for (jaar in jaren) {
     for (gebiedsniveau in gebiedsniveaus) {
       if (!dir.exists(file.path(output_folder, jaar, gebiedsniveau))){
@@ -117,20 +119,20 @@ MaakKubusData <- function(
   }
   
   
-  # dummy_crossing toevoegen (als die er nog niet in zat) om lege crossings te vermijden
-  crossings <- unique(c(crossings, dummy_crossing_var)) 
-  
-  # Combinatie maken tussen elke configuratie regel, variabele en crossing variabelen
+  # Dummy crossing toevoegen zodat ook zonder echte crossing een dimensie beschikbaar is.
+  crossings <- unique(c(crossings, dummy_crossing_var))
+
+  # Configs bouwen: elke combinatie van configuratie, variabele en crossing.
   configs <- tidyr::expand_grid(
     configuraties,
     vars_df,
     crossings
   )
   
-  # Verwijder alle rows waar geen_crossing maar toch wel crossing
+  # Verwijder combinaties waarin geen_crossings geldt maar toch een echte crossing staat.
   configs <- configs |> 
     filter(!(geen_crossings & crossings != dummy_crossing_var))
-  
+
   # Bij geen_crossings alles behalve dummy var weghalen
   configs <- configs |> 
     filter(!(geen_crossings == TRUE & crossings != dummy_crossing_var))
@@ -139,6 +141,42 @@ MaakKubusData <- function(
   configs <- configs |> 
     filter(!(geen_crossings == FALSE & crossings == dummy_crossing_var))
   
+  # Pre-split data per dataset om herhaalde filtering te vermijden (performance optimalisatie)
+  data_by_dataset <- split(data, data$tbl_dataset)
+  
+  # Pre-cache labels voor variabelen en crossings (performance optimalisatie)
+  var_labels_cache <- lapply(stats::setNames(vars, vars), function(v) {
+    vl <- labelled::val_labels(data[[v]])
+    if (is.null(vl) || length(vl) == 0) {
+      unieke_vals <- sort(unique(data[[v]][!is.na(data[[v]])]))
+      vl <- stats::setNames(as.numeric(unieke_vals), as.character(unieke_vals))
+    }
+    vl
+  })
+  
+  var_name_cache <- lapply(stats::setNames(vars, vars), function(v) {
+    nm <- labelled::var_label(data[[v]])
+    if (is.null(nm) || is.na(nm)) nm <- v
+    nm
+  })
+  
+  crossing_labels_cache <- lapply(stats::setNames(crossings, crossings), function(cr) {
+    if (!cr %in% names(data)) return(NULL)
+    cr_lbls <- labelled::val_labels(data[[cr]])
+    if (is.null(cr_lbls) || length(cr_lbls) == 0) {
+      vals <- sort(unique(data[[cr]][!is.na(data[[cr]])]))
+      cr_lbls <- stats::setNames(as.character(vals), as.character(vals))
+    }
+    cr_lbls
+  })
+  
+  crossing_name_cache <- lapply(stats::setNames(crossings, crossings), function(cr) {
+    if (!cr %in% names(data)) return(cr)
+    nm <- labelled::var_label(data[[cr]])
+    if (is.null(nm) || is.na(nm)) nm <- cr
+    nm
+  })
+  
   # Over elke regel van de config lopen om de platte kubusdata te maken
   configs |> 
     pwalk(function(...){
@@ -146,14 +184,13 @@ MaakKubusData <- function(
       bron <- args$bron
       is_kubus <- if (isTRUE(args$geen_crossings)) 0 else 1
       
-      # Weegfactor bepalen
-      # 1. Standaard uit configuratie
-      # 2. Override uit variabelen (var_weegfactor)
-      # 3. Override voor specifieke dataset (var_weegfactor.d[id] of var_weegfactor.d_[naam])
+      # Weegfactor bepalen met prioriteit:
+      # 1) dataset-specifieke override op naam, 2) dataset-specifieke override op id,
+      # 3) algemene override uit variabelen, 4) standaard uit configuratie.
       
       current_weegfactor <- args$weegfactor
       
-      # Check overrides
+      # Overridekolommen dynamisch bepalen zodat configuraties flexibel zijn.
       ds_name_col <- paste0("var_weegfactor.d_", args$naam_dataset)
       ds_id_col <- paste0("var_weegfactor.d", args$tbl_dataset)
       global_col <- "var_weegfactor"
@@ -168,13 +205,15 @@ MaakKubusData <- function(
       
       
       
-      # Kopie maken om orginele data niet aan te tasten
-      kubusdata <- data |> 
-        filter(tbl_dataset == args$tbl_dataset) |> 
+      # Gebruik pre-split data voor snellere toegang (vermijdt herhaalde filtering)
+      kubusdata <- data_by_dataset[[as.character(args$tbl_dataset)]]
+      if (is.null(kubusdata) || nrow(kubusdata) == 0) return()
+      kubusdata <- kubusdata |> 
         mutate(geolevel = args$gebiedsniveau)
       
       
       
+      # Jaar bepalen: vaste waarde wanneer jaarvariabele ontbreekt, anders filteren op jaar.
       if (is.na(args$jaarvariabele)) {
         kubusdata <- kubusdata |> 
           mutate(Jaar = args$jaar_voor_analyse)
@@ -185,11 +224,7 @@ MaakKubusData <- function(
           filter(Jaar == as.integer(args$jaar_voor_analyse))
       }
       
-      if (isTRUE(args$geen_crossings)) {
-        # TODO: geen dummy_crossing en Dimensies tabbladen aanmaken
-      }
-      
-      # Als Gebiedsindeling_kolom is NA, dan omzetten naar een 1
+      # Als Gebiedsindeling_kolom ontbreekt, maak één geocode (1) zodat er toch output is.
       if (is.na(args$gebiedsindeling_kolom)) {
         kubusdata <- kubusdata |> 
           mutate(geoitem = 1)
@@ -220,20 +255,22 @@ MaakKubusData <- function(
                       !is.na(.data[[args$vars]]),
                       !is.na(.data[[current_weegfactor]]))
       
-      # Alleen crossing filteren wanneer use_crossing == TRUE
+      # Alleen crossing filteren wanneer er een echte crossing wordt gebruikt.
       if (use_crossing) {
         kubusdata <- kubusdata |>
           dplyr::filter(!is.na(.data[[args$crossings]]))
       }
       
-      kubusdata <- kubusdata |> 
-        group_by(across(all_of(c(grouping_cols, args$vars)))) |> 
-        summarise(
-          n_gewogen = sum(!!sym(current_weegfactor), na.rm = TRUE),
-          n_ongewogen = n(),
-          .groups = "drop"
-        )
+      # Gebruik data.table voor snellere aggregatie (performance optimalisatie)
+      dt <- data.table::as.data.table(kubusdata)
+      by_cols <- c(grouping_cols, args$vars)
+      wf_col <- current_weegfactor
+      kubusdata <- dt[, .(n_gewogen = sum(get(wf_col), na.rm = TRUE), 
+                          n_ongewogen = .N), 
+                      by = by_cols]
+      kubusdata <- tibble::as_tibble(kubusdata)
       
+      # Geen records na filtering: log en ga door naar volgende config.
       if (nrow(kubusdata) == 0) {
         if (is_kubus) {
           out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), as.character(args$gebiedsniveau))
@@ -246,7 +283,7 @@ MaakKubusData <- function(
         return()
       }
       
-      # Pivot naar breed: zowel gewogen als ongewogen meenemen (voor celmaskering)
+      # Pivot naar breed: zowel gewogen als ongewogen meenemen voor masking.
       kubusdata <- kubusdata |>
         tidyr::pivot_wider(
           id_cols = dplyr::all_of(grouping_cols),
@@ -256,64 +293,59 @@ MaakKubusData <- function(
           names_sep = "_"
         )
       
-      # Herbereken totaal ongewogen ONG als som van n_ongewogen_* kolommen
+      # Herbereken totaal ongewogen ONG als som van n_ongewogen_* kolommen.
+      # Gebruik vectorized rowSums i.p.v. trage rowwise() (performance optimalisatie)
       ongewogen_cols <- grep("^n_ongewogen_", names(kubusdata), value = TRUE)
+      ong_col_name <- paste0(args$vars, "_ONG")
       if (length(ongewogen_cols) > 0) {
-        kubusdata <- kubusdata |>
-          dplyr::rowwise() |>
-          dplyr::mutate(!!paste0(args$vars, "_ONG") := sum(dplyr::c_across(dplyr::all_of(ongewogen_cols)), na.rm = TRUE)) |>
-          dplyr::ungroup()
+        kubusdata[[ong_col_name]] <- rowSums(kubusdata[, ongewogen_cols, drop = FALSE], na.rm = TRUE)
       } else {
         # als er om wat voor reden dan ook geen ongewogen kolommen zijn, fallback op 0
-        kubusdata[[paste0(args$vars, "_ONG")]] <- 0
+        kubusdata[[ong_col_name]] <- 0
       }
       
-      # Gewogen kolommen hernoemen naar {variabele}_{waarde} (n_gewogen_0 -> VAR_0)
+      # Gewogen kolommen hernoemen naar {variabele}_{waarde} voor Swing-conventie.
       gewogen_cols <- grep("^n_gewogen_", names(kubusdata), value = TRUE)
       if (length(gewogen_cols) > 0) {
         nieuwe_namen <- sub("^n_gewogen_", paste0(args$vars, "_"), gewogen_cols)
         names(kubusdata)[match(gewogen_cols, names(kubusdata))] <- nieuwe_namen
       }
       
-      # Labels van de inhoudelijke variabele
-      vl <- labelled::val_labels(data[[args$vars]])
-      if (is.null(vl) || length(vl) == 0) {
-        unieke_vals <- sort(unique(data[[args$vars]]))
-        vl <- stats::setNames(as.numeric(unieke_vals), as.character(unieke_vals))
-      }
+      # Labels ophalen uit pre-cached data (performance optimalisatie)
+      vl <- var_labels_cache[[args$vars]]
       ans_values <- as.character(unname(vl))   # codes zoals "0","1","2"
       ans_labels <- names(vl)                  # labels zoals "Ja","Nee",...
       
-      # Lijsten met kolommen
+      # Kolomnamen voor gewogen/ongewogen output en totalen.
       antwoordkolommen <- paste0(args$vars, "_", ans_values)     # gewogen data-kolommen
       ongewogen_celkolommen <- paste0("n_ongewogen_", ans_values) # per-antwoord ongewogen aantallen (alleen voor maskering)
       ong_col <- paste0(args$vars, "_ONG")
       
-      # Zorg dat alle kolommen aanwezig zijn (ontbrekende aanmaken)
+      # Zorg dat alle kolommen aanwezig zijn (ontbrekende aanmaken met 0).
       ontbrekend_w <- setdiff(antwoordkolommen, names(kubusdata))
       if (length(ontbrekend_w) > 0) for (mc in ontbrekend_w) kubusdata[[mc]] <- 0
       ontbrekend_u <- setdiff(ongewogen_celkolommen, names(kubusdata))
       if (length(ontbrekend_u) > 0) for (mc in ontbrekend_u) kubusdata[[mc]] <- 0
       if (!ong_col %in% names(kubusdata)) kubusdata[[ong_col]] <- 0
       
-      # Basis-kolommen voor Data
+      # Basis-kolommen voor Data: tijd, geo en eventueel crossing.
       base_cols <- c("Jaar", "geolevel", "geoitem")
       if (!isTRUE(args$geen_crossings) && args$crossings %in% names(kubusdata)) {
         base_cols <- c(base_cols, args$crossings)
       }
       
-      # Filter op volgorde en houd alleen Swing-kolommen in Data (ongewogen celniveau kolommen blijven alleen voor maskering)
+      # Alleen Swing-kolommen behouden; ongewogen celniveau blijft impliciet in kubusdata.
       data_cols <- c(base_cols, antwoordkolommen, ong_col)
       data_cols <- data_cols[data_cols %in% names(kubusdata)]
       
-      # Privacy: rijniveau (ONG < min_obs_vraag) -> alle waarden missing
+      # Privacy: rijniveau (ONG < min_obs_vraag) -> alle waarden maskeren.
       rij_te_weinig <- kubusdata[[ong_col]] < min_obs_vraag & kubusdata[[ong_col]] != afkapwaarde
       if (any(rij_te_weinig, na.rm = TRUE)) {
         kubusdata[rij_te_weinig, antwoordkolommen] <- afkapwaarde
         kubusdata[rij_te_weinig, ong_col] <- afkapwaarde
       }
       
-      # Privacy: celniveau (n_ongewogen_<code> < min_obs_cel) -> alleen die cel missing
+      # Privacy: celniveau (n_ongewogen_<code> < min_obs_cel) -> alleen die cel maskeren.
       if (min_obs_cel > 0) {
         for (i in seq_along(ans_values)) {
           cel_u_col <- ongewogen_celkolommen[i]
@@ -327,21 +359,21 @@ MaakKubusData <- function(
         }
       }
       
-      # Data klaarzetten (zonder de n_ongewogen_* hulpkolommen)
+      # Data klaarzetten voor export (zonder n_ongewogen_* hulpkolommen).
       kubus_df <- kubusdata |>
         dplyr::select(dplyr::all_of(data_cols))
       
-      # Excel workbook opbouwen
+      # Excel workbook opbouwen met standaard Swing tabbladen.
       wb <- openxlsx::createWorkbook()
       
-      # 1) Data
+      # 1) Data: kernoutput met gewogen waarden en ONG.
       openxlsx::addWorksheet(wb, "Data")
       openxlsx::writeData(wb, "Data", kubus_df)
       style_fmt <- openxlsx::createStyle(numFmt = "[=-99996]0;0.000")
       openxlsx::addStyle(wb, "Data", style_fmt, cols = which(names(kubus_df) %in% antwoordkolommen), 
                          rows = 2:(nrow(kubus_df) + 1), gridExpand = TRUE)
       
-      # 2) Data_def
+      # 2) Data_def: kolomdefinities met type (period/geolevel/geoitem/dim/var).
       openxlsx::addWorksheet(wb, "Data_def")
       data_def_cols <- c("Jaar", "geolevel", "geoitem")
       if (!isTRUE(args$geen_crossings) && args$crossings %in% names(kubus_df)) {
@@ -351,15 +383,17 @@ MaakKubusData <- function(
       data_def_cols <- data_def_cols[data_def_cols %in% names(kubus_df)]
       data_def <- data.frame(
         col = data_def_cols,
-        type = c(
-          "period", "geolevel", "geoitem",
-          if (!isTRUE(args$geen_crossings) && args$crossings %in% names(kubus_df)) "dim" else NULL,
-          rep("var", sum(data_def_cols %in% antwoordkolommen) + as.integer(ong_col %in% data_def_cols))
+        type = dplyr::case_when(
+          data_def_cols == "Jaar" ~ "period",
+          data_def_cols == "geolevel" ~ "geolevel",
+          data_def_cols == "geoitem" ~ "geoitem",
+          data_def_cols == args$crossings ~ "dim",
+          TRUE ~ "var"
         )
       )
       openxlsx::writeData(wb, "Data_def", data_def)
       
-      # 3) Label_var
+      # 3) Label_var: beschrijving van indicators.
       openxlsx::addWorksheet(wb, "Label_var")
       label_var <- data.frame(
         Onderwerpcode = c(antwoordkolommen, ong_col),
@@ -371,23 +405,16 @@ MaakKubusData <- function(
       # 4) Dimensies + items (alleen met crossings)
       if (!isTRUE(args$geen_crossings) && args$crossings %in% colnames(data)) {
         openxlsx::addWorksheet(wb, "Dimensies")
-        dim_naam <- labelled::var_label(data[[args$crossings]])
-        if (is.null(dim_naam) || is.na(dim_naam)) dim_naam <- args$crossings
+        # Gebruik pre-cached crossing naam (performance optimalisatie)
+        dim_naam <- crossing_name_cache[[args$crossings]]
         openxlsx::writeData(
           wb, "Dimensies",
           data.frame(Dimensiecode = args$crossings, Naam = dim_naam)
         )
         
         openxlsx::addWorksheet(wb, args$crossings)
-        if (args$crossings %in% names(data) && "labelled" %in% class(data[[args$crossings]])) {
-          cr_lbls <- labelled::val_labels(data[[args$crossings]])
-        } else {
-          cr_lbls <- NULL
-        }
-        if (is.null(cr_lbls) || length(cr_lbls) == 0) {
-          vals <- sort(unique(data[[args$crossings]]))
-          cr_lbls <- stats::setNames(as.character(vals), as.character(vals))
-        }
+        # Gebruik pre-cached crossing labels (performance optimalisatie)
+        cr_lbls <- crossing_labels_cache[[args$crossings]]
         df_items <- data.frame(
           Itemcode = unname(cr_lbls),
           Naam = names(cr_lbls),
@@ -396,10 +423,10 @@ MaakKubusData <- function(
         openxlsx::writeData(wb, args$crossings, df_items)
       }
       
-      # 5) Indicators
+      # 5) Indicators: Swing indicator-definities inclusief formules.
       openxlsx::addWorksheet(wb, "Indicators")
-      variabel_naam <- labelled::var_label(data[[args$vars]])
-      if (is.null(variabel_naam) || is.na(variabel_naam)) variabel_naam <- args$vars
+      # Gebruik pre-cached variabele naam (performance optimalisatie)
+      variabel_naam <- var_name_cache[[args$vars]]
       
       is_dichotoom <- suppressWarnings(all(as.numeric(ans_values) %in% c(0,1)) && length(ans_values) == 2)
       
@@ -444,25 +471,24 @@ MaakKubusData <- function(
                               if (is_dichotoom) min_obs_vraag else rep(min_obs_vraag, length(ans_values))),
         `Threshold Indicator` = c(rep("", length(ans_values) + 2),
                                   if (is_dichotoom) paste0(args$vars, "_ONG") else rep(paste0(args$vars, "_ONG"), length(ans_values))),
-        Cube = c(rep(is_kubus, length(ans_values) + 2),
-                 if (is_dichotoom) is_kubus else rep(is_kubus, length(ans_values))),
+        Cube = rep(1, length(indicator_codes)), # Cube moet blijkbaar altijd 1 zijn
         Source = rep(bron, length(indicator_codes)),
         check.names = FALSE
       )
       openxlsx::writeData(wb, "Indicators", indicators_df)
       
       # Opslaan in submap {output_folder}/{jaar}/{gebiedsniveau}
-      
       if (is_kubus) {
         out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), as.character(args$gebiedsniveau))
         if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-        bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, "_", args$crossing, ".xlsx"))
+        bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, "_", args$crossings, ".xlsx"))
       } else {
         out_dir <- file.path(output_folder, as.character(args$jaar_voor_analyse), paste0(as.character(args$gebiedsniveau), "_totaal"))
         if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
         bestandsnaam <- file.path(out_dir, paste0(output_bestandsnaam_prefix, "_", args$vars, ".xlsx"))
       }
       
+      # Schrijfbestand opslaan; errors loggen zonder het hele proces te stoppen.
       tryCatch({
         openxlsx::saveWorkbook(wb, file = bestandsnaam, overwrite = TRUE)
         msg("Kubusdata opgeslagen voor %s: %s", args$vars, bestandsnaam, level = MSG)
@@ -470,8 +496,7 @@ MaakKubusData <- function(
         msg("Fout bij opslaan kubusdata voor %s: %s", args$vars, e$message, level = ERR)
       })
 
-    },
-    .progress = TRUE
-    )
-  
+      },
+      .progress = TRUE
+      )
 }
