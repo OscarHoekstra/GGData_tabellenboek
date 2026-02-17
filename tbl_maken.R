@@ -1042,7 +1042,9 @@ log.save = T
     MaakKubusData(data = data,
                   configuraties = swing_configuraties,
                   variabelen = swing_variabelen,
-                  crossings = swing_crossings)
+                  crossings = swing_crossings,
+                  parallel = TRUE,
+                  workers = 4)
   }
   
   
