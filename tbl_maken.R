@@ -229,7 +229,7 @@ log.save = T
   } else{
     msg("Geen kloppend tabblad crossings. Deze moet bestaan uit één of twee kolommen; crossings en (optioneel) toetsen. Standaard is 'crossings' in cel A1 en verder een lege sheet. Voor meer informatie zie documentatie.", level=ERR)
   }
-
+  
   if (any(crossings %in% onderdelen$subset)) {
     msg("De variabele(n) %s is/zijn ingevuld als crossing en subset. Een subset kan niet met zichzelf gekruist worden.",
         str_c(crossings[crossings %in% onderdelen$subset], ", "), level=WARN)
@@ -552,11 +552,11 @@ log.save = T
         rename(stratum = strata)
       if(file.exists(datasets$fpc[d])){
         # als het een pad is: zoek de fpc data op en berekenen sampling prob per stratum
-          fpc_data <- fpc_data %>% left_join(
-            read.xlsx(datasets$fpc[d]) %>% 
-              mutate(stratum = as.factor(stratum)),
-            join_by(stratum == stratum)
-          ) %>% 
+        fpc_data <- fpc_data %>% left_join(
+          read.xlsx(datasets$fpc[d]) %>% 
+            mutate(stratum = as.factor(stratum)),
+          join_by(stratum == stratum)
+        ) %>% 
           mutate(fpc = populatiegrootte)
       } else if(grepl("GROOTGEWICHT_", datasets$fpc[d])){
         if(is.na(datasets$stratum[d])){stop("Bij FPC is het verplicht een stratum op te geven.")}
@@ -596,11 +596,11 @@ log.save = T
         msg("Er bevinden zich kleine strata in de data waarvoor de geschatte populatiegrootte kleiner is dan aantal respondenten. Er wordt nu aangenomen dat de populatiegrootte hier gelijk is aan aantal respondenten. Het gaat om:", level=MSG)
         fpc_per_respondent <- fpc_per_respondent %>% 
           mutate(
-          fpc = case_when(
-            fpc < Freq ~ Freq,
-            T ~ fpc
+            fpc = case_when(
+              fpc < Freq ~ Freq,
+              T ~ fpc
+            )
           )
-        )
         print(fpc_per_respondent[is_small_strata,])
       }
       
@@ -858,8 +858,19 @@ log.save = T
         # deze functie werd eerst meerdere keren aangeroepen in tbl_MakeExcel, wat natuurlijk veel meer resources kost
         # helaas zijn de resultaten die inmiddels opgeslagen zijn wel volgens de oude manier berekend, dus moeten we de correctie voor de zekerheid uitvoeren
         results = results %>% distinct()
+        
+        # Backwards compatible check voor opgeslagen alpha 
+        if ("corrected_alpha" %in% colnames(kolom_opbouw.prev)) {
+          cached_alpha = head(kolom_opbouw.prev$corrected_alpha, 1)
+          if (!is.na(cached_alpha)) {
+            algemeen$confidence_level = cached_alpha
+            kolom_opbouw$corrected_alpha = cached_alpha # Zorg dat het in the huidige sessie klopt
+            msg("Opgeslagen Multiple Testing correctie gevonden in cache. Alpha ingesteld op: %e", cached_alpha, level=MSG)
+          }
+        } else {
+          msg("Let op! De geladen cache (settings.csv) is van een oudere versie en bevat geen 'corrected_alpha'. De standaardwaarde uit de configuratie (%s) wordt gebruikt. Als je een Multiple Testing correctie wilt toepassen, zet dan 'forceer_berekening' op WAAR in het tabblad algemeen.", algemeen$confidence_level, level=WARN)
+        }
       }
-      
     } else {
       msg("Er zijn eerdere resultaten aangetroffen vanuit deze configuratie (%s), maar de instellingen waren niet identiek. Berekening wordt opnieuw uitgevoerd.", basename(config.file), level=MSG)
     }
@@ -923,7 +934,7 @@ log.save = T
           }
         }
       }
-
+      
       # aanmaken van design, afhankelijk van of er fpc is.
       if("fpc" %in% colnames(datasets)){
         design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, fpc=~fpc, data=data.tmp)  
@@ -939,15 +950,81 @@ log.save = T
       
       msg("Variabele %d/%d berekend; rekentijd %0.1f sec.", i, nrow(varlist), t.after-t.before, level=MSG)
     }
+    
     t.end = proc.time()["elapsed"]
     msg("Totale rekentijd %0.2f min voor %d variabelen. Gemiddelde tijd per variabele was %0.1f sec (range %0.1f - %0.1f).",
         (t.end-t.start)/60, nrow(varlist), mean(t.vars), min(t.vars), max(t.vars), level=MSG)
     
-    # aangezien een tweede subset vaker kan draaien moeten we hier een distinct op doen
     results = results %>% distinct()
     
+    # MTC Berekenen VOORDAT we opslaan
+    
+    # multiple testing correctie, indien gewenst
+    # normaliter zou je hiervoor p.adjust() kunnen gebruiken, maar er is een probleem;
+    # doordat we een rij hebben per losse waarde en per crossingwaarde krijg je een artificieel hoog aantal testen, wat niet daadwerkelijk zo is
+    # ter voorbeeld: stel dat er 1 crossing is (man/vrouw) voor een vraag met 3 antwoorden, dan zijn er totaal 6 p-waardes; A1 m/v, A2 m/v, A3 m/v (A = antwoord)
+    # dit registreert in p.adjust() dan als 6 testen, terwijl er in de realiteit 3 zijn uitgevoerd; A1 m vs. v, A2 m vs. v, A3 m vs. v
+    # we moeten dus terugrekenen hoeveel testen er daadwerkelijk zijn uitgevoerd
+    # concreet betekent dit:
+    # -> voor iedere rij waarin sign.vs != NA (want anders is er sowieso geen toets uitgevoerd)
+    # -> deel door aantal crossings, indien aanwezig
+    # -> deel door 2 indien dichotoom (makkelijk te herkennen aan precies 2 antwoordmogelijkheden en gelijke p-waarde)
+    # dit is met p.adjust() lastig te corrigeren, dus in plaats daarvan kunnen we gewoon de gewenste p-waarde aanpassen
+    # stiekem overschrijven we algemeen$confidence_level dan met de gecorrigeerde afkapwaarde
+    corrected_alpha = algemeen$confidence_level # Startwaarde
+    
+    if("multiple_testing_correction" %in% colnames(algemeen) && !is.na(algemeen$multiple_testing_correction)) {
+      
+      sign_indexes = !is.na(results$sign.vs)
+      sign_tests = results[sign_indexes,] %>%
+        group_by(subset, subset.val, year, crossing, crossing.val, var, sign.vs, sign) %>%
+        summarize(n=n(), .groups='drop') %>%
+        group_by(subset, subset.val, year, crossing, var, sign.vs, sign) %>%
+        summarize(n_total=sum(n), crossing_n=n(), n=n_total/crossing_n, .groups='drop')
+      
+      # op dit punt hebben we een tabel met precies de uitgevoerde toetsen;
+      # - crossings hebben een n_total van [aantal antwoordmogelijkheden * aantal crossings] en een n van [aantal antwoordmogelijkheden]
+      # - dichotome variabelen hebben een n van 2 (dus gelijk aan crossings, indien n 2 is)
+      # hierdoor kunnen we simpelweg het aantal rijen tellen, en dan hebben we het aantal testen
+      n_sign_tests = nrow(sign_tests)
+      
+      if ("aantal_toetsen" %in% colnames(algemeen) && !is.na(algemeen$aantal_toetsen)) {
+        n_sign_tests = algemeen$aantal_toetsen
+        msg("Let op! Het aantal toetsen voor de multiple testing correction is vanuit de configuratie omgezet van %d naar %d. Als dit niet de bedoeling is, pas dan de configuratie aan.",
+            nrow(sign_tests), n_sign_tests, level=WARN)
+      }
+      
+      if (grepl("bh|benjamini|hochberg", algemeen$multiple_testing_correction, T)) {
+        if(n_sign_tests > nrow(sign_tests)){
+          msg("Let op! Het aantal in de configuratie opgegeven toetsen is hoger dan het aantal in dit tabellenboek. Met Benjamini-Hochberg-correctie kan dit vertekende resultaten opleveren.", level=WARN)
+        }
+        pvals = sort(sign_tests$sign)
+        pvals = pvals[!is.na(pvals)]
+        bh.table = matrix(nrow = length(pvals), ncol = 3)
+        bh.table[,1] = pvals
+        bh.table[,2] = (1:n_sign_tests)[1:length(pvals)]
+        bh.table[,3] = (bh.table[,2]/n_sign_tests) * algemeen$confidence_level # berekening Aart
+        
+        if (sum(bh.table[,1] < bh.table[,3]) < 1) {
+          # geen enkele significante waarde
+          corrected_alpha = 1e-20
+          msg("Na Benjamini-Hochberg-correctie is er geen enkele p-waarde significant.", level=WARN)
+        } else {
+          corrected_alpha = max(bh.table[bh.table[,1] < bh.table[,3],1])
+        }
+        msg("Benjamini-Hochberg correctie toegepast. Nieuwe alpha: %e", corrected_alpha, level=MSG)
+        
+      } else if (grepl("bf|bonferonni|bonferroni", algemeen$multiple_testing_correction, T)) {
+        corrected_alpha = algemeen$confidence_level / n_sign_tests
+        msg("Bonferroni correctie toegepast. Nieuwe alpha: %e", corrected_alpha, level=MSG)
+      }
+    }
+    
+    # Pas toe op sessie en voeg toe aan CSV export
+    algemeen$confidence_level = corrected_alpha
+    kolom_opbouw$corrected_alpha = corrected_alpha
+    
     # resultaten opslaan voor hergebruik
-    # N.B.: alles in UTF-8 om problemen met een trema o.i.d. te voorkomen
     write.csv(varlist, sprintf("resultaten_csv/vars_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(var_labels, sprintf("resultaten_csv/varlabels_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(kolom_opbouw, sprintf("resultaten_csv/settings_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
@@ -958,72 +1035,6 @@ log.save = T
   ##### begin wegschrijven tabellenboeken
   basefilename = coalesce(opmaak$waarde[opmaak$type == "naam_tabellenboek"], "Overzicht")
   
-  # multiple testing correctie, indien gewenst
-  # normaliter zou je hiervoor p.adjust() kunnen gebruiken, maar er is een probleem;
-  # doordat we een rij hebben per losse waarde en per crossingwaarde krijg je een artificieel hoog aantal testen, wat niet daadwerkelijk zo is
-  # ter voorbeeld: stel dat er 1 crossing is (man/vrouw) voor een vraag met 3 antwoorden, dan zijn er totaal 6 p-waardes; A1 m/v, A2 m/v, A3 m/v (A = antwoord)
-  # dit registreert in p.adjust() dan als 6 testen, terwijl er in de realiteit 3 zijn uitgevoerd; A1 m vs. v, A2 m vs. v, A3 m vs. v
-  # we moeten dus terugrekenen hoeveel testen er daadwerkelijk zijn uitgevoerd
-  # concreet betekent dit:
-  # -> voor iedere rij waarin sign.vs != NA (want anders is er sowieso geen toets uitgevoerd)
-  # -> deel door aantal crossings, indien aanwezig
-  # -> deel door 2 indien dichotoom (makkelijk te herkennen aan precies 2 antwoordmogelijkheden en gelijke p-waarde)
-  # dit is met p.adjust() lastig te corrigeren, dus in plaats daarvan kunnen we gewoon de gewenste p-waarde aanpassen
-  # stiekem overschrijven we algemeen$confidence_level dan met de gecorrigeerde afkapwaarde
-  if("multiple_testing_correction" %in% colnames(algemeen) && !is.na(algemeen$multiple_testing_correction) && !"confidence_level_orig" %in% colnames(algemeen)) {
-    # om te voorkomen dat deze berekening 2x gedaan wordt
-    algemeen$confidence_level_orig = algemeen$confidence_level
-    
-    sign_indexes = !is.na(results$sign.vs)
-    sign_tests = results[sign_indexes,] %>%
-      group_by(subset, subset.val, year, crossing, crossing.val, var, sign.vs, sign) %>%
-      summarize(n=n()) %>%
-      group_by(subset, subset.val, year, crossing, var, sign.vs, sign) %>%
-      summarize(n_total=sum(n), crossing_n=n(), n=n_total/crossing_n)
-    # op dit punt hebben we een tabel met precies de uitgevoerde toetsen;
-    # - crossings hebben een n_total van [aantal antwoordmogelijkheden * aantal crossings] en een n van [aantal antwoordmogelijkheden]
-    # - dichotome variabelen hebben een n van 2 (dus gelijk aan crossings, indien n 2 is)
-    # hierdoor kunnen we simpelweg het aantal rijen tellen, en dan hebben we het aantal testen
-    n_sign_tests = nrow(sign_tests)
-    
-    if ("aantal_toetsen" %in% colnames(algemeen) && !is.na(algemeen$aantal_toetsen)) {
-      n_sign_tests = algemeen$aantal_toetsen
-      msg("Let op! Het aantal toetsen voor de multiple testing correction is vanuit de configuratie omgezet van %d naar %d. Als dit niet de bedoeling is, pas dan de configuratie aan.",
-          nrow(sign_tests), n_sign_tests, level=WARN)
-    }
-    
-    if(!is.na(algemeen$multiple_testing_correction)){
-      if (grepl("bh|benjamini|hochberg", algemeen$multiple_testing_correction, T)) {
-        if(n_sign_tests > nrow(sign_tests)){
-          msg("Let op! Het aantal in de configuratie opgegeven toetsen is hoger dan het aantal in dit tabellenboek. Met Benjamini-Hochberg-correctie kan dit vertekende resultaten opleveren.", level=WARN)
-        }
-        pvals = sort(sign_tests$sign)
-        pvals = pvals[!is.na(pvals)]
-        
-        bh.table = matrix(nrow = length(pvals), ncol = 3)
-        bh.table[,1] = pvals
-        bh.table[,2] = (1:n_sign_tests)[1:length(pvals)]
-        bh.table[,3] = (bh.table[,2]/n_sign_tests)*algemeen$confidence_level_orig # berekening Aart
-        
-        if (sum(bh.table[,1] < bh.table[,3]) < 1) {
-          # geen enkele significante waarde
-          algemeen$confidence_level = 1e-20
-          msg("Na Benjamini-Hochberg-correctie is er geen enkele p-waarde significant.", level=WARN)
-        } else {
-          algemeen$confidence_level = max(bh.table[bh.table[,1] < bh.table[,3],1])
-          msg("De gewenste afkapwaarde voor significantie is met Benjamini-Hochberg-correctie op basis van %d toetsen aangepast van %e naar %e.",
-              n_sign_tests, algemeen$confidence_level_orig, algemeen$confidence_level, level=MSG)
-        }
-      } else if (grepl("bf|bonferonni|bonferroni|bonferronni", algemeen$multiple_testing_correction, T)) {
-        algemeen$confidence_level = algemeen$confidence_level / n_sign_tests
-        msg("De gewenste afkapwaarde voor significantie is met Bonferroni-correctie op basis van %d toetsen aangepast van %e naar %e.",
-            n_sign_tests, algemeen$confidence_level_orig, algemeen$confidence_level, level=MSG)
-      } else {
-        msg("Er is geen geldige waarde opgegeven voor multiple_testing_correction. Geldigde waardes zijn 'BH' voor Benjamini-Hochberg of 'bonferroni' voor Bonferroni.", level=ERR)
-      }
-    }
-
-  }
   
   # controleren of de gewenste logo's bestaan - anders kunnen de HTML- en Excel-functies ze niet openen
   if (nrow(logos) > 0) {
