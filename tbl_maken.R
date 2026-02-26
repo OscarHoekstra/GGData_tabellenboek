@@ -35,7 +35,6 @@ library(glue)
 # instellen werkmap voor het laden van de andere bestanden
 setwd(dirname(this.path()))
 source("tbl_helpers.R")
-source("tbl_MakeKubus.R") # Nieuw script sourcen
 
 # niveau van weergave van meldingen
 # mogelijke waarden: ERR / WARN / MSG / DEBUG, waarbij een hoger niveau melding altijd weergegeven wordt
@@ -64,7 +63,7 @@ log.save = T
   
   
   # algemene instellingen voor de libraries
-  options(survey.lonely.psu="certainty")
+  options(survey.lonely.psu="certainty") 
   options("openxlsx.paperSize"=9) # A4
   options("openxlsx.orientation"="landscape")
   options("openxlsx.numFmt"="0") # standaardformaat zonder decimalen (anders 0.0 invullen)
@@ -127,6 +126,11 @@ log.save = T
     msg("Het is van belang om deze opties alsnog toe te voegen aan de configuratie; in een volgende versie van het script zal deze waarschuwing vervangen worden door een fout.", level=WARN)
     algemeen$vraag_verbergen_bij_missend_antwoord = F
     algemeen$afkapwaarde_antwoord = 0.0
+  }
+  if (!("benader_chisq" %in% colnames(algemeen))){
+    msg("Let op! Er is een nieuwe optie toegevoegd aan het tabblad algemeen: benader_chisq. (Zie de handleiding.)", level=WARN)
+    msg("Deze opties missen momenteel in de configuratie. Er wordt nu de standaardwaarde ONWAAR aangenomen", level=WARN)
+    algemeen$benader_chisq <- F
   }
   
   # bestaat het templatebestand voor digitoegankelijkheid? (indien gewenst)
@@ -634,11 +638,14 @@ log.save = T
         stratum = strata
       ) %>% left_join(
         fpc_data,
-        join_by(stratum==stratum)
+        join_by(stratum == stratum)
       )
       is_small_strata <- fpc_per_respondent$Freq >= fpc_per_respondent$populatiegrootte
-      if(any(is_small_strata)){
-        msg("Er bevinden zich kleine strata in de data waarvoor de geschatte populatiegrootte kleiner is dan aantal respondenten. Er wordt nu aangenomen dat de populatiegrootte gelijk is aan aantal respondenten. Het gaat om:", level=MSG)
+      if(any(is.na(fpc_per_respondent$stratum))){
+        msg("Er bevinden zich %s respondenten met een missend strata in de dataset. Deze worden niet meegenomen in de weging.", sum(is.na(fpc_per_respondent$stratum)), level=MSG)
+      }
+      if(any(is_small_strata, na.rm = T)){
+        msg("Er bevinden zich kleine strata in de data waarvoor de geschatte populatiegrootte kleiner is dan aantal respondenten. Er wordt nu aangenomen dat de populatiegrootte hier gelijk is aan aantal respondenten. Het gaat om:", level=MSG)
         fpc_per_respondent <- fpc_per_respondent %>% 
           mutate(
             fpc = case_when(
@@ -904,8 +911,17 @@ log.save = T
         # deze functie werd eerst meerdere keren aangeroepen in tbl_MakeExcel, wat natuurlijk veel meer resources kost
         # helaas zijn de resultaten die inmiddels opgeslagen zijn wel volgens de oude manier berekend, dus moeten we de correctie voor de zekerheid uitvoeren
         results = results %>% distinct()
+        
+        # Backwards compatible check voor opgeslagen alpha 
+        alpha_file = sprintf("resultaten_csv/alphas_%s.csv", basename(config.file))
+        if (file.exists(alpha_file)) {
+          mtc_per_subset = read.csv(alpha_file, fileEncoding="UTF-8")
+          msg("Opgeslagen Multiple Testing correctie(s) gevonden in cache (alphas.csv).", level=MSG)
+        } else {
+          msg("Let op! Geen alphas cache gevonden. De standaardwaarde uit de configuratie wordt gebruikt.", level=WARN)
+          mtc_per_subset = data.frame(subset=character(), subset.val=numeric(), corrected_alpha=numeric(), n_tests=numeric())
+        }
       }
-      
     } else {
       msg("Er zijn eerdere resultaten aangetroffen vanuit deze configuratie (%s), maar de instellingen waren niet identiek. Berekening wordt opnieuw uitgevoerd.", basename(config.file), level=MSG)
     }
@@ -1024,19 +1040,100 @@ log.save = T
     msg("Totale rekentijd %0.2f min voor %d variabelen. Gemiddelde tijd per variabele was %0.1f sec (range %0.1f - %0.1f).",
         (t.end-t.start)/60, nrow(varlist), mean(t.vars), min(t.vars), max(t.vars), level=MSG)
     
-    # aangezien een tweede subset vaker kan draaien moeten we hier een distinct op doen
     results = results %>% distinct()
     
+    # MTC Berekenen VOORDAT we opslaan
+    
+    # multiple testing correctie, indien gewenst
+    # normaliter zou je hiervoor p.adjust() kunnen gebruiken, maar er is een probleem;
+    # doordat we een rij hebben per losse waarde en per crossingwaarde krijg je een artificieel hoog aantal testen, wat niet daadwerkelijk zo is
+    # ter voorbeeld: stel dat er 1 crossing is (man/vrouw) voor een vraag met 3 antwoorden, dan zijn er totaal 6 p-waardes; A1 m/v, A2 m/v, A3 m/v (A = antwoord)
+    # dit registreert in p.adjust() dan als 6 testen, terwijl er in de realiteit 3 zijn uitgevoerd; A1 m vs. v, A2 m vs. v, A3 m vs. v
+    # we moeten dus terugrekenen hoeveel testen er daadwerkelijk zijn uitgevoerd
+    # concreet betekent dit:
+    # -> voor iedere rij waarin sign.vs != NA (want anders is er sowieso geen toets uitgevoerd)
+    # -> deel door aantal crossings, indien aanwezig
+    # -> deel door 2 indien dichotoom (makkelijk te herkennen aan precies 2 antwoordmogelijkheden en gelijke p-waarde)
+    # dit is met p.adjust() lastig te corrigeren, dus in plaats daarvan kunnen we gewoon de gewenste p-waarde aanpassen
+    # stiekem overschrijven we algemeen$confidence_level dan met de gecorrigeerde afkapwaarde
+    
+    if("multiple_testing_correction" %in% colnames(algemeen) && !is.na(algemeen$multiple_testing_correction)) {
+      
+      sign_indexes = !is.na(results$sign.vs)
+      
+      # op dit punt hebben we een tabel met precies de uitgevoerde toetsen;
+      # - crossings hebben een n_total van [aantal antwoordmogelijkheden * aantal crossings] en een n van [aantal antwoordmogelijkheden]
+      # - dichotome variabelen hebben een n van 2 (dus gelijk aan crossings, indien n 2 is)
+      # hierdoor kunnen we simpelweg het aantal rijen tellen, en dan hebben we het aantal testen
+      
+      sign_tests = results[sign_indexes,] %>%
+        group_by(subset, subset.val, year, crossing, crossing.val, var, sign.vs, sign) %>%
+        summarize(n=n(), .groups='drop') %>%
+        group_by(subset, subset.val, year, crossing, var, sign.vs, sign) %>%
+        summarize(n_total=sum(n), crossing_n=n(), n=n_total/crossing_n, .groups='drop')
+      
+      # Bereken MTC gegroepeerd per subset
+      mtc_per_subset = sign_tests %>%
+        group_by(subset, subset.val) %>%
+        group_modify(~ {
+          n_sign_tests = nrow(.x)
+          
+          if ("aantal_toetsen" %in% colnames(algemeen) && !is.na(algemeen$aantal_toetsen)) {
+            n_sign_tests = algemeen$aantal_toetsen
+            # Waarschuwing wordt later globaal gegeven om spam per subset te voorkomen
+          }
+          
+          corrected_alpha = algemeen$confidence_level
+          
+          if (grepl("bh|benjamini|hochberg", algemeen$multiple_testing_correction, ignore.case=T)) {
+            pvals = sort(.x$sign[!is.na(.x$sign)])
+            if(length(pvals) > 0) {
+              bh.table = matrix(nrow = length(pvals), ncol = 3)
+              bh.table[,1] = pvals
+              bh.table[,2] = (1:n_sign_tests)[1:length(pvals)]
+              bh.table[,3] = (bh.table[,2]/n_sign_tests) * algemeen$confidence_level # berekening Aart
+              
+              if (sum(bh.table[,1] < bh.table[,3]) < 1) {
+                # geen enkele significante waarde
+                corrected_alpha = 1e-20
+              } else {
+                corrected_alpha = max(bh.table[bh.table[,1] < bh.table[,3],1])
+              }
+            } else {
+              corrected_alpha = 1e-20
+            }
+          } else if (grepl("bf|bonferonni|bonferroni", algemeen$multiple_testing_correction, ignore.case=T)) {
+            corrected_alpha = algemeen$confidence_level / n_sign_tests
+          }
+          
+          tibble(corrected_alpha = corrected_alpha, n_tests = n_sign_tests)
+        }) %>%
+        ungroup()
+      
+      if ("aantal_toetsen" %in% colnames(algemeen) && !is.na(algemeen$aantal_toetsen)) {
+        msg("Let op! Het aantal toetsen voor de multiple testing correction is vanuit de configuratie omgezet naar %d. Als dit niet de bedoeling is, pas dan de configuratie aan.", algemeen$aantal_toetsen, level=WARN)
+      }
+      msg("Multiple Testing Correctie (%s) is berekend PER SUBSET.", algemeen$multiple_testing_correction, level=MSG)
+      
+    } else {
+      # Geen MTC gewenst, maak een lege dummy dataframe
+      mtc_per_subset = data.frame(subset=character(), subset.val=numeric(), corrected_alpha=numeric(), n_tests=numeric())
+    }
+    
     # resultaten opslaan voor hergebruik
-    # N.B.: alles in UTF-8 om problemen met een trema o.i.d. te voorkomen
     write.csv(varlist, sprintf("resultaten_csv/vars_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(var_labels, sprintf("resultaten_csv/varlabels_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(kolom_opbouw, sprintf("resultaten_csv/settings_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(results, sprintf("resultaten_csv/results_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(fpc_data, sprintf("resultaten_csv/fpc_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
+    write.csv(mtc_per_subset, sprintf("resultaten_csv/alphas_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
   }
   
+  ##### begin wegschrijven tabellenboeken
+  basefilename = coalesce(opmaak$waarde[opmaak$type == "naam_tabellenboek"], "Overzicht")
   
+
+
   source(paste0(dirname(this.path()), "/tbl_MakeKubus.R"))
   if (algemeen$swing_output) {
     MaakKubusData(data = data,
@@ -1044,73 +1141,7 @@ log.save = T
                   variabelen = swing_variabelen,
                   crossings = swing_crossings)
   }
-  
-  
-  
-  ##### begin wegschrijven tabellenboeken
-  basefilename = coalesce(opmaak$waarde[opmaak$type == "naam_tabellenboek"], "Overzicht")
-  
-  # multiple testing correctie, indien gewenst
-  # normaliter zou je hiervoor p.adjust() kunnen gebruiken, maar er is een probleem;
-  # doordat we een rij hebben per losse waarde en per crossingwaarde krijg je een artificieel hoog aantal testen, wat niet daadwerkelijk zo is
-  # ter voorbeeld: stel dat er 1 crossing is (man/vrouw) voor een vraag met 3 antwoorden, dan zijn er totaal 6 p-waardes; A1 m/v, A2 m/v, A3 m/v (A = antwoord)
-  # dit registreert in p.adjust() dan als 6 testen, terwijl er in de realiteit 3 zijn uitgevoerd; A1 m vs. v, A2 m vs. v, A3 m vs. v
-  # we moeten dus terugrekenen hoeveel testen er daadwerkelijk zijn uitgevoerd
-  # concreet betekent dit:
-  # -> voor iedere rij waarin sign.vs != NA (want anders is er sowieso geen toets uitgevoerd)
-  # -> deel door aantal crossings, indien aanwezig
-  # -> deel door 2 indien dichotoom (makkelijk te herkennen aan precies 2 antwoordmogelijkheden en gelijke p-waarde)
-  # dit is met p.adjust() lastig te corrigeren, dus in plaats daarvan kunnen we gewoon de gewenste p-waarde aanpassen
-  # stiekem overschrijven we algemeen$confidence_level dan met de gecorrigeerde afkapwaarde
-  if("multiple_testing_correction" %in% colnames(algemeen) && !is.na(algemeen$multiple_testing_correction) && !"confidence_level_orig" %in% colnames(algemeen)) {
-    # om te voorkomen dat deze berekening 2x gedaan wordt
-    algemeen$confidence_level_orig = algemeen$confidence_level
-    
-    sign_indexes = !is.na(results$sign.vs)
-    sign_tests = results[sign_indexes,] %>%
-      group_by(subset, subset.val, year, crossing, crossing.val, var, sign.vs, sign) %>%
-      summarize(n=n()) %>%
-      group_by(subset, subset.val, year, crossing, var, sign.vs, sign) %>%
-      summarize(n_total=sum(n), crossing_n=n(), n=n_total/crossing_n)
-    # op dit punt hebben we een tabel met precies de uitgevoerde toetsen;
-    # - crossings hebben een n_total van [aantal antwoordmogelijkheden * aantal crossings] en een n van [aantal antwoordmogelijkheden]
-    # - dichotome variabelen hebben een n van 2 (dus gelijk aan crossings, indien n 2 is)
-    # hierdoor kunnen we simpelweg het aantal rijen tellen, en dan hebben we het aantal testen
-    n_sign_tests = nrow(sign_tests)
-    
-    if ("aantal_toetsen" %in% colnames(algemeen) && !is.na(algemeen$aantal_toetsen)) {
-      n_sign_tests = algemeen$aantal_toetsen
-      msg("Let op! Het aantal toetsen voor de multiple testing correction is vanuit de configuratie omgezet van %d naar %d. Als dit niet de bedoeling is, pas dan de configuratie aan.",
-          nrow(sign_tests), n_sign_tests, level=WARN)
-    }
-    
-    if (algemeen$multiple_testing_correction == "BH") {
-      pvals = sort(sign_tests$sign)
-      pvals = pvals[!is.na(pvals)]
-      
-      bh.table = matrix(nrow = length(pvals), ncol = 3)
-      bh.table[,1] = pvals
-      bh.table[,2] = (1:n_sign_tests)[1:length(pvals)]
-      bh.table[,3] = (bh.table[,2]/n_sign_tests)*algemeen$confidence_level_orig # berekening Aart
-      
-      if (sum(bh.table[,1] < bh.table[,3]) < 1) {
-        # geen enkele significante waarde
-        algemeen$confidence_level = 1e-20
-        msg("Na Benjamini-Hochberg-correctie is er geen enkele p-waarde significant.", level=WARN)
-      } else {
-        algemeen$confidence_level = max(bh.table[bh.table[,1] < bh.table[,3],1])
-        msg("De gewenste afkapwaarde voor significantie is met Benjamini-Hochberg-correctie op basis van %d toetsen aangepast van %e naar %e.",
-            n_sign_tests, algemeen$confidence_level_orig, algemeen$confidence_level, level=MSG)
-      }
-    } else if (algemeen$multiple_testing_correction == "bonferroni") {
-      algemeen$confidence_level = algemeen$confidence_level / n_sign_tests
-      msg("De gewenste afkapwaarde voor significantie is met Bonferroni-correctie op basis van %d toetsen aangepast van %e naar %e.",
-          n_sign_tests, algemeen$confidence_level_orig, algemeen$confidence_level, level=MSG)
-    } else {
-      msg("Er is geen geldige waarde opgegeven voor multiple_testing_correction. Geldigde waardes zijn 'BH' voor Benjamini-Hochberg of 'bonferroni' voor Bonferroni.", level=ERR)
-    }
-  }
-  
+
   # controleren of de gewenste logo's bestaan - anders kunnen de HTML- en Excel-functies ze niet openen
   if (nrow(logos) > 0) {
     for (i in 1:nrow(logos)) {
@@ -1120,27 +1151,33 @@ log.save = T
     }
   }
   
+  
+  default_alpha = algemeen$confidence_level # Bewaar origineel
+  
   if (!is.na(algemeen$template_html)) {
     # uitdraaien tabellenboeken in HTML-vorm voor digitoegankelijkheid
     source(paste0(dirname(this.path()), "/tbl_MakeHtml.R"))
-    
     template_html = read_file(algemeen$template_html)
     
     if (is.null(subsetmatches)) {
       # geen subsets, 1 tabellenboek
+      alpha_row = mtc_per_subset[is.na(mtc_per_subset$subset), ]
+      algemeen$confidence_level = if(nrow(alpha_row) > 0) alpha_row$corrected_alpha[1] else default_alpha
+      
       msg("Digitoegankelijk tabellenboek wordt gemaakt.", level=MSG)
       MakeHtml(results, var_labels, kolom_opbouw, NA, NA, subsetmatches, n_resp, template_html, filename=basefilename)
     } else {
       # wel subsets, meerdere tabellenboeken
       subsetvals = subsetmatches[, 1]
-      # bij een subset met slechts 1 niveau valt de naam weg bij de bovenstaande selectie
-      # om dit te voorkomen voegen we 'm zelf nog een keer toe
       names(subsetvals) = rownames(subsetmatches)
       for (s in 1:length(subsetvals)) {
-        if (sum(results$subset == colnames(subsetmatches)[1] & results$subset.val == subsetvals[s], na.rm=T) < 1)
-          next # geen data gevonden voor deze subset, overslaan
+        if (sum(results$subset == colnames(subsetmatches)[1] & results$subset.val == subsetvals[s], na.rm=T) < 1) next 
         
-        msg("Digitoegankelijk tabellenboek voor %s wordt gemaakt.", names(subsetvals[s]), level=MSG)
+        # Haal specifieke alpha voor deze subset op uit de MTC file
+        alpha_row = mtc_per_subset[!is.na(mtc_per_subset$subset) & mtc_per_subset$subset == colnames(subsetmatches)[1] & mtc_per_subset$subset.val == subsetvals[s], ]
+        algemeen$confidence_level = if(nrow(alpha_row) > 0) alpha_row$corrected_alpha[1] else default_alpha
+        
+        msg("Digitoegankelijk tabellenboek voor %s wordt gemaakt (alpha: %e).", names(subsetvals[s]), algemeen$confidence_level, level=MSG)
         MakeHtml(results, var_labels, kolom_opbouw, colnames(subsetmatches)[1], subsetvals[s], subsetmatches, n_resp, template_html, filename=paste0(basefilename, " ", names(subsetvals[s])))
       }
     }
@@ -1150,6 +1187,9 @@ log.save = T
   source(paste0(dirname(this.path()), "/tbl_MakeExcel.R"))
   if (is.null(subsetmatches)) {
     # geen subsets, 1 tabellenboek
+    alpha_row = mtc_per_subset[is.na(mtc_per_subset$subset), ]
+    algemeen$confidence_level = if(nrow(alpha_row) > 0) alpha_row$corrected_alpha[1] else default_alpha
+    
     msg("Tabellenboek wordt gemaakt.", level=MSG)
     MakeExcel(results, var_labels, kolom_opbouw, NA, NA, subsetmatches, n_resp, filename=basefilename)
   } else {
@@ -1157,10 +1197,13 @@ log.save = T
     subsetvals = subsetmatches[, 1]
     names(subsetvals) = rownames(subsetmatches)
     for (s in 1:length(subsetvals)) {
-      if (sum(results$subset == colnames(subsetmatches)[1] & results$subset.val == subsetvals[s], na.rm=T) < 1)
-        next # geen data gevonden voor deze subset, overslaan
+      if (sum(results$subset == colnames(subsetmatches)[1] & results$subset.val == subsetvals[s], na.rm=T) < 1) next 
       
-      msg("Tabellenboek voor %s wordt gemaakt.", names(subsetvals[s]), level=MSG)
+      # Haal specifieke alpha voor deze subset op uit de MTC file
+      alpha_row = mtc_per_subset[!is.na(mtc_per_subset$subset) & mtc_per_subset$subset == colnames(subsetmatches)[1] & mtc_per_subset$subset.val == subsetvals[s], ]
+      algemeen$confidence_level = if(nrow(alpha_row) > 0) alpha_row$corrected_alpha[1] else default_alpha
+      
+      msg("Tabellenboek voor %s wordt gemaakt (alpha: %e).", names(subsetvals[s]), algemeen$confidence_level, level=MSG)
       MakeExcel(results, var_labels, kolom_opbouw, colnames(subsetmatches)[1], subsetvals[s], subsetmatches, n_resp, filename=paste0(basefilename, " ", names(subsetvals[s])))
     }
   }
