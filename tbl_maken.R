@@ -89,7 +89,11 @@ log.save = T
   available_sheets <- getSheetNames(config.file)
   
   for (sheet in sheets) {
-    if (!sheet %in% available_sheets) next
+    
+    if (!sheet %in% available_sheets) {
+      msg("Tabblad %s bestaat niet in het configuratiebestand. Dit kan door een fout komen of omdat je met een oude configuratiebestand werkt. De functionaliteit uit dit tabblad wordt waar mogelijk overgeslagen.", sheet, level = WARN)
+      next
+    }
     
     tmp = read.xlsx(config.file, sheet=sheet)
     
@@ -938,16 +942,23 @@ log.save = T
     current_design <- NULL
     
     # Basis variabelen bepalen (die altijd in het design moeten zitten)
+    # we kunnen de dataset die de functie in moet flink verkleinen; alle variabelen
+    # behalve[var], dummy._col[1:n], dummy.[var], de subsets en de crossings kunnen eruit
     base_vars_names <- c(kolom_opbouw$crossing, kolom_opbouw$subset, colnames(data)[str_starts(colnames(data), "dummy._col")],
-                   "superstrata", "superweegfactor", "fpc", "tbl_dataset", weight.factors)
+                         "superstrata", "superweegfactor", "fpc", "tbl_dataset", weight.factors)
     base_vars_names <- unique(base_vars_names[!is.na(base_vars_names)])
     
     # Weegfactor logica voorbereiden
     has_weight_logic <- any(str_detect(colnames(varlist), "weegfactor"))
     weegfactorvars <- NULL
     if (has_weight_logic) {
-         weegfactorvars = str_match(colnames(varlist), "weegfactor(.*)")
-         weegfactorvars = matrix(weegfactorvars[!is.na(weegfactorvars[,1]),], ncol=2)
+      # tijd om te huilen
+      # mogelijke opties:
+      # "weegfactor" -> override voor die variabele
+      # "weegfactor.d[getal]" -> override voor die variabele in dataset[getal]
+      # "weegfactor.d_[naam]" -> override voor die variabele in dataset[naam]
+      weegfactorvars = str_match(colnames(varlist), "weegfactor(.*)")
+      weegfactorvars = matrix(weegfactorvars[!is.na(weegfactorvars[,1]),], ncol=2) # het moet via een matrix met 2 kolommen, omdat R anders een enkele rij omzet naar een vector
     }
     
     for (i in 1:nrow(varlist)) {
@@ -961,15 +972,15 @@ log.save = T
       # 1. Bepaal Weight Config Key voor caching
       current_weight_config <- "default"
       if (has_weight_logic) {
-         current_vals <- c()
-         for(k in 1:nrow(weegfactorvars)) {
-             wfname <- weegfactorvars[k,1]
-             val <- varlist[[wfname]][i]
-             if(!is.na(val)) current_vals <- c(current_vals, paste(wfname, val, sep="="))
-         }
-         if(length(current_vals) > 0) {
-             current_weight_config <- paste(sort(current_vals), collapse="|")
-         }
+        current_vals <- c()
+        for(k in 1:nrow(weegfactorvars)) {
+          wfname <- weegfactorvars[k,1]
+          val <- varlist[[wfname]][i]
+          if(!is.na(val)) current_vals <- c(current_vals, paste(wfname, val, sep="="))
+        }
+        if(length(current_vals) > 0) {
+          current_weight_config <- paste(sort(current_vals), collapse="|")
+        }
       }
       
       # Variabelen specifiek voor deze var
@@ -978,46 +989,54 @@ log.save = T
       
       # 2. Check Cache
       if (!is.null(current_design) && identical(current_weight_config, last_weight_config)) {
-          # CACHE HIT: Update design
-          for(col in current_var_cols) {
-              current_design$variables[[col]] <- data[[col]]
-          }
+        # CACHE HIT: Update design
+        for(col in current_var_cols) {
+          current_design$variables[[col]] <- data[[col]]
+        }
       } else {
-          # CACHE MISS: Nieuw design
-          vars_to_select <- unique(c(base_vars_names, current_var_cols))
-          data.tmp <- data %>% select(any_of(vars_to_select))
-          
-          # Weegfactor logica
-          if (has_weight_logic && length(current_weight_config) > 0 && current_weight_config != "default") {
-            for (j in 1:nrow(weegfactorvars)) {
-              wfname = weegfactorvars[j,1]
-              wfdataset = weegfactorvars[j,2]
-              
-              if (wfname == "weegfactor" && !is.na(varlist$weegfactor[i])) {
-                data.tmp$superweegfactor = data.tmp[[varlist$weegfactor[i]]]
-              } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d(\\d+)$")) { 
-                dataset = as.numeric(str_match(wfdataset, "(\\d+)")[,2])
-                data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
-              } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d_(.+)")) { 
-                dataset = str_match(wfdataset, "^\\.d_(.+)")[,2]
-                if (!dataset %in% datasets$naam_dataset) {
-                  msg("Er is een weegfactor opgegeven in indeling_rijen voor dataset %s, maar deze dataset is niet bekend. Controleer de configuratie.", dataset, level=ERR)
-                }
-                dataset = which(datasets$naam_dataset == dataset)
-                data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
-              } else if (!is.na(varlist[[wfname]][i])) {
-                 msg("Onbekende weegfactordefinitie opgegeven: %s. Controleer de configuratie.", wfname, level=ERR)
+        # CACHE MISS: Nieuw design
+        vars_to_select <- unique(c(base_vars_names, current_var_cols))
+        data.tmp <- data %>% select(any_of(vars_to_select))
+        
+        # nu wordt het ingewikkeld: in de monitor VO zijn verschillende weegfactoren nodig per jaar
+        # dit betekent dat we per variabele EN per dataset een andere weegfactor kunnen hebben
+        # daarvoor kan een combinatieweegfactor gemaakt worden, als er gewerkt wordt met één groot combinatiebestand,
+        # of er kan een 'superweegfactor' gemaakt worden, gelijkend aan de superweegfactor die door combinatie hierboven ontstaan is
+        # aangezien niet alle GGD'en een overkoepelend bestand hebben is hier gekozen voor de tweede optie
+        # gezien de complexiteit wordt deze code lelijk, daar is helaas weinig aan te doen
+        
+        # Weegfactor logica
+        if (has_weight_logic && length(current_weight_config) > 0 && current_weight_config != "default") {
+          for (j in 1:nrow(weegfactorvars)) {
+            wfname = weegfactorvars[j,1]
+            wfdataset = weegfactorvars[j,2]
+            
+            if (wfname == "weegfactor" && !is.na(varlist$weegfactor[i])) {
+              data.tmp$superweegfactor = data.tmp[[varlist$weegfactor[i]]]
+            } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d(\\d+)$")) { # numeriek, dus d[getal]
+              dataset = as.numeric(str_match(wfdataset, "(\\d+)")[,2])
+              data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
+            } else if (!is.na(varlist[[wfname]][i]) && str_detect(wfdataset, "^\\.d_(.+)")) { # naam van een dataset
+              dataset = str_match(wfdataset, "^\\.d_(.+)")[,2]
+              if (!dataset %in% datasets$naam_dataset) {
+                msg("Er is een weegfactor opgegeven in indeling_rijen voor dataset %s, maar deze dataset is niet bekend. Controleer de configuratie.", dataset, level=ERR)
               }
+              dataset = which(datasets$naam_dataset == dataset)
+              data.tmp$superweegfactor[data.tmp$tbl_dataset == dataset] = data.tmp[[varlist[[wfname]][i]]][data.tmp$tbl_dataset == dataset]
+            } else if (!is.na(varlist[[wfname]][i])) {
+              msg("Onbekende weegfactordefinitie opgegeven: %s. Controleer de configuratie.", wfname, level=ERR)
             }
           }
-          
-          if("fpc" %in% colnames(datasets)){
-            current_design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, fpc=~fpc, data=data.tmp)  
-          } else {
-            current_design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, data=data.tmp)
-          }
-          
-          last_weight_config <- current_weight_config
+        }
+        
+        # aanmaken van design, afhankelijk van of er fpc is.
+        if("fpc" %in% colnames(datasets)){
+          current_design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, fpc=~fpc, data=data.tmp)  
+        } else {
+          current_design = svydesign(ids=~1, strata=~superstrata, weights=~superweegfactor, data=data.tmp)
+        }
+        
+        last_weight_config <- current_weight_config
       }
       
       t.before = proc.time()["elapsed"]
@@ -1062,7 +1081,7 @@ log.save = T
       sign_indexes = !is.na(results$sign.vs)
       
       # op dit punt hebben we een tabel met precies de uitgevoerde toetsen;
-      # - crossings hebben een n_total van [aantal antwoordmogelijkheden * aantal crossings] en een n van [aantal antwoordmogelijkheden]
+      # - crossings hebben een n_total van[aantal antwoordmogelijkheden * aantal crossings] en een n van [aantal antwoordmogelijkheden]
       # - dichotome variabelen hebben een n van 2 (dus gelijk aan crossings, indien n 2 is)
       # hierdoor kunnen we simpelweg het aantal rijen tellen, en dan hebben we het aantal testen
       
@@ -1128,6 +1147,18 @@ log.save = T
     write.csv(fpc_data, sprintf("resultaten_csv/fpc_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
     write.csv(mtc_per_subset, sprintf("resultaten_csv/alphas_%s.csv", basename(config.file)), fileEncoding="UTF-8", row.names=F)
   }
+  
+  
+  
+  # Kubusdata generatie (Swing)
+  source(paste0(dirname(this.path()), "/tbl_MakeKubus.R"))
+  if (algemeen$swing_output) {
+    MaakKubusData(data = data,
+                  configuraties = swing_configuraties,
+                  variabelen = swing_variabelen,
+                  crossings = swing_crossings)
+  }
+  
   
   ##### begin wegschrijven tabellenboeken
   basefilename = coalesce(opmaak$waarde[opmaak$type == "naam_tabellenboek"], "Overzicht")
