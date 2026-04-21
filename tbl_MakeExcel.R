@@ -172,6 +172,7 @@ MakeExcel = function (results, var_labels, col.design, subset, subset.val, subse
   A_TOOSMALL = -1
   Q_TOOSMALL = -2
   Q_MISSING = -3
+  A_EXACTZERO = -4
   
   c = 1 # teller voor rijen in Excel
   
@@ -294,7 +295,7 @@ MakeExcel = function (results, var_labels, col.design, subset, subset.val, subse
           if (col.design$subset[j] != subset) {
             subset.col = subsetmatches[subsetmatches[,1] == subset.val, col.design$subset[j]]
           }
-          cols = c("val", "crossing", "crossing.val", "sign", "sign.vs", "n.unweighted", "perc.weighted", "display_include", "is_dichotoom")
+          cols = c("var", "val", "crossing", "crossing.val", "sign", "sign.vs", "n.unweighted", "n_question", "perc.weighted", "suppression", "display_include", "is_dichotoom")
           cols = cols[cols %in% colnames(results)]
           data.tmp = results[which(NA.identical(results$dataset, col.design$dataset[j]) & NA.identical(results$subset, col.design$subset[j]) &
                                      NA.identical(results$subset.val, subset.col) &
@@ -305,9 +306,8 @@ MakeExcel = function (results, var_labels, col.design, subset, subset.val, subse
           if (nrow(data.tmp) == 0) next
           data.tmp$col.index = j
           data.var = bind_rows(data.var, data.tmp)
-        }
-        else {
-          cols = c("val", "crossing", "crossing.val", "sign", "sign.vs", "n.unweighted", "perc.weighted", "display_include", "is_dichotoom")
+        } else {
+          cols = c("var", "val", "crossing", "crossing.val", "sign", "sign.vs", "n.unweighted", "n_question", "perc.weighted", "suppression", "display_include", "is_dichotoom")
           cols = cols[cols %in% colnames(results)]
           data.tmp = results[which(NA.identical(results$dataset, col.design$dataset[j]) & NA.identical(results$subset, col.design$subset[j]) &
                                      is.na(results$subset.val) &
@@ -354,31 +354,38 @@ MakeExcel = function (results, var_labels, col.design, subset, subset.val, subse
         if (!is.null(algemeen$weergave) && algemeen$weergave == "n")
           output[vals,j] = data.var$n[data.var$col.index == j & data.var$val %in% rownames(output)]
         
-        # waarden onder de afkapgrens vervangen
-        output[which(output[,j] <= algemeen$afkapwaarde_antwoord),j] = A_TOOSMALL
-        
-        #PS:
-        #Metingen die o.b.v te lage aantallen zijn vervangen 
-        if (!is.na(indeling_rijen$verberg_crossings[i]) && !is.na(col.design$crossing[j])) {
-          output[,j] = Q_MISSING
-        } else if (sum(data.var$n.unweighted[data.var$col.index == j], na.rm=T) == 0) {
-          output[,j] = Q_MISSING
-        } else if (sum(data.var$n.unweighted[data.var$col.index == j], na.rm=T) < algemeen$min_observaties_per_vraag) {
-          #Alle percentages wegstrepen als aantallen per groep te klein zijn.
-          output[,j] <- Q_TOOSMALL
-        } else if(any(data.var$n.unweighted[data.var$col.index == j] < algemeen$min_observaties_per_antwoord, na.rm=T)) {
-          # Bij een cel met te weinig antwoorden zijn er twee opties:
-          # 1) De hele kolom verbergen, om herleidbaarheid te voorkomen.
-          # 2) Alleen die cel verbergen.
-          # De keuze hierin is discutabel, dus we laten het over aan de onderzoekers zelf.
-          if (algemeen$vraag_verbergen_bij_missend_antwoord) {
-            #Alle percentages wegstrepen als tenminste 1 van de aantallen per antwoord te klein is.
-            output[,j] <- A_TOOSMALL
+        # onderdrukking toepassen
+        # als de suppression-kolom beschikbaar is (nieuwe cache), gebruik die; anders de oude logica (backwards compatible)
+        if ("suppression" %in% colnames(data.var)) {
+          # nieuwe methode: suppression vooraf berekend in tbl_maken.R
+          data.col = data.var[data.var$col.index == j & data.var$val %in% rownames(output), ]
+          for (v in data.col$val) {
+            sup = data.col$suppression[data.col$val == v]
+            if (length(sup) > 0 && sup != 0) {
+              output[as.character(v), j] = sup
+            }
           }
-          else {
-            # alleen de cel wegstrepen
-            data.col = data.var[data.var$col.index == j & data.var$val %in% rownames(output),]
-            output[rownames(output) %in% data.col$val[which(data.col$n.unweighted < algemeen$min_observaties_per_antwoord)],j] <- A_TOOSMALL
+        } else {
+          # oude methode: onderdrukking hier berekenen (backwards compatible met cache zonder suppression)
+          n_q_vals <- data.var$n_question[data.var$col.index == j]
+          n_q <- if (length(n_q_vals) > 0) n_q_vals[1] else 0
+          
+          output[which(output[,j] == 0), j] = A_EXACTZERO
+          output[which(output[,j] <= algemeen$afkapwaarde_antwoord & output[,j] > 0), j] = A_TOOSMALL
+          
+          if (!is.na(indeling_rijen$verberg_crossings[i]) && !is.na(col.design$crossing[j])) {
+            output[,j] = Q_MISSING
+          } else if (n_q == 0) {
+            output[,j] = Q_MISSING
+          } else if (n_q < algemeen$min_observaties_per_vraag) {
+            output[,j] <- Q_TOOSMALL
+          } else if (any(data.var$n.unweighted[data.var$col.index == j] < algemeen$min_observaties_per_antwoord, na.rm=T)) {
+            if (algemeen$vraag_verbergen_bij_missend_antwoord) {
+              output[,j] <- A_TOOSMALL
+            } else {
+              data.col = data.var[data.var$col.index == j & data.var$val %in% rownames(output),]
+              output[rownames(output) %in% data.col$val[which(data.col$n.unweighted < algemeen$min_observaties_per_antwoord)],j] <- A_TOOSMALL
+            }
           }
         }
         
@@ -525,7 +532,7 @@ MakeExcel = function (results, var_labels, col.design, subset, subset.val, subse
       addStyle(wb, subset.name, style.num, cols=3:n.col.total, rows=c:(c+nrow(output)), gridExpand=T, stack=T)
       
       # missende waardes goed weergeven
-      missing = which(output == Q_MISSING | output == Q_TOOSMALL | output == A_TOOSMALL, arr.ind=T)
+      missing = which(output == Q_MISSING | output == Q_TOOSMALL | output == A_TOOSMALL | output == A_EXACTZERO, arr.ind=T)
       if (length(missing) > 0) {
         # vanwege gekke R logica mag de waarde geen naam hebben (unname) en moet het gedwongen een matrix zijn
         replacement = data.frame(row=missing[,1], col=missing[,2], val=matrix(unname(output[missing])))
@@ -534,6 +541,7 @@ MakeExcel = function (results, var_labels, col.design, subset, subset.val, subse
           val = algemeen$tekst_missende_data
           if (as.numeric(replacement$val[i]) == Q_TOOSMALL) val = algemeen$tekst_min_vraag_niet_gehaald
           if (as.numeric(replacement$val[i]) == A_TOOSMALL) val = algemeen$tekst_min_antwoord_niet_gehaald
+          if (as.numeric(replacement$val[i]) == A_EXACTZERO) val = 0
           writeData(wb, subset.name, val, startCol=replacement$col[i], startRow=c+replacement$row[i]-1, colNames=F)
         }
       }
